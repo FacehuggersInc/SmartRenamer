@@ -3074,12 +3074,16 @@ def util_define_season_ranges(folder: Path = None):
 
     print(f"  Define each season as a range of episode numbers.")
     print(f"  {DIM}Example: season 1 → 1-12, season 2 → 13-24{R}")
+    print(f"  {DIM}Ranges must move forward — each one must start after the last,")
+    print(f"  and none can go beyond episode {highest} (the highest one found).{R}")
     blank()
 
     ranges: list[tuple[int, int, int]] = []   # (season_num, start_ep, end_ep)
-    next_season = 1
 
     while True:
+        next_season = len(ranges) + 1
+        highest_used = max((b for _, _, b in ranges), default=lowest - 1)
+
         if ranges:
             blank()
             print(f"  {BOLD}Ranges so far:{R}")
@@ -3087,31 +3091,52 @@ def util_define_season_ranges(folder: Path = None):
                 print(f"    Season {s:02d}:  episodes {a}–{b}")
             blank()
 
-        raw = input(f"  Season {next_season} range (e.g. \"1-12\", or 'done'): ").strip().lower()
+        raw = input(
+            f"  Season {next_season} range (e.g. \"1-12\" · 'undo' · 'done' · 'b'=back): "
+        ).strip().lower()
 
         if raw in ("b", "back"):
+            if ranges:
+                # Treat 'back' mid-loop as "undo the last range" rather
+                # than abandoning everything already entered — only exit
+                # the whole utility if nothing has been defined yet.
+                removed = ranges.pop()
+                info(f"Removed Season {removed[0]:02d} ({removed[1]}–{removed[2]}).")
+                continue
             raise Back()
+
+        if raw == "undo":
+            if ranges:
+                removed = ranges.pop()
+                info(f"Removed Season {removed[0]:02d} ({removed[1]}–{removed[2]}).")
+            else:
+                warn("Nothing to undo.")
+            continue
+
         if raw == "done":
             break
 
         m = re.match(r'^(\d+)\s*-\s*(\d+)$', raw)
         if not m:
-            err("Format: <start>-<end>, e.g. 1-12")
+            err("Format: <start>-<end>, e.g. 1-12  (or 'undo' / 'done' / 'b')")
             continue
         start, end = int(m.group(1)), int(m.group(2))
         if start > end:
             start, end = end, start
 
-        overlap = [
-            (s, a, b) for s, a, b in ranges
-            if not (end < a or start > b)
-        ]
-        if overlap:
-            err(f"Overlaps with season {overlap[0][0]} ({overlap[0][1]}–{overlap[0][2]}).")
+        if start <= highest_used:
+            if ranges:
+                err(f"Must start after episode {highest_used} "
+                    f"(the end of season {ranges[-1][0]}'s range).")
+            else:
+                err(f"Must start at episode {lowest} or later — that's the lowest one found.")
+            continue
+
+        if end > highest:
+            err(f"Episode {end} doesn't exist — only {highest} episodes were found.")
             continue
 
         ranges.append((next_season, start, end))
-        next_season += 1
 
     if not ranges:
         warn("No ranges defined — nothing to do.")
