@@ -736,6 +736,8 @@ CAPTURE_BLOCKS = {
                 "example": ("Horimiya - Episode 01 - A Tiny Happenstance 1080p", "A Tiny Happenstance")},
     "quality": {"label": "Quality / resolution", "regex": r"(?P<quality>\d{3,4}p)",
                 "example": ("Horimiya - Episode 01 - Title 1080p BDRip", "1080p")},
+    "text":    {"label": "Any text (variable length)", "regex": r"(?P<text>.+?)",
+                "example": ("Show S01E02 [982497234]", "982497234 (inside brackets)")},
 }
 
 SEPARATOR_BLOCKS = {
@@ -758,21 +760,53 @@ def _block_regex(key: str, custom_text: str = "") -> str:
     return SEPARATOR_BLOCKS[key]["regex"]
 
 
+FREE_TEXT_BLOCK_KEYS = {"show", "title", "text"}
+
+
+def _strip_group_names(pattern: str) -> str:
+    """
+    Convert (?P<name>...) to (?:...) so a block's regex can be reused
+    inside a lookahead without redefining the same named group twice.
+    Lookaheads only need to match the same shape, not capture anything.
+    """
+    return re.sub(r"\(\?P<\w+>", "(?:", pattern)
+
+
 def _assemble_regex(sequence: list[dict]) -> str:
+    """
+    Any free-text block (show, title, text) becomes a lazy capture that
+    stops right before whatever block comes next in the sequence —
+    figured out generically from that next block's own regex, not a
+    hardcoded list of special cases. This means free-text blocks work
+    correctly no matter what follows them: a quality tag, a bracket,
+    custom literal text, another capture block, anything.
+
+    If a free-text block is the LAST block in the sequence, it instead
+    stops at a sensible default boundary (a bracket tag, a trailing
+    "-ReleaseGroup" suffix, or end of string) so it doesn't swallow an
+    entire junk tail that was never explicitly labelled.
+    """
     parts = []
     for i, item in enumerate(sequence):
         key = item["key"]
         rx  = _block_regex(key, item.get("custom", ""))
-        if key == "title":
-            nxt = sequence[i + 1]["key"] if i + 1 < len(sequence) else ""
-            if nxt == "quality":
-                rx = r"(?P<title>.+?)\s+"
-            elif i == len(sequence) - 1:
-                rx = r"(?P<title>.+?)(?=\s*\[|\s*-\s*\w+$|$)"
+
+        if key in FREE_TEXT_BLOCK_KEYS:
+            nxt = sequence[i + 1] if i + 1 < len(sequence) else None
+            if nxt is not None:
+                nxt_rx = _strip_group_names(_block_regex(nxt["key"], nxt.get("custom", "")))
+                rx = f"(?P<{key}>.+?)(?=" + nxt_rx + ")"
             else:
-                rx = r"(?P<title>.+?)"
+                rx = f"(?P<{key}>.+?)(?=\\s*\\[|\\s*-\\s*\\w+$|$)"
+
         parts.append(rx)
-    return "^" + "".join(parts) + r"(?:[\s\[].*)?$"
+    return "^" + "".join(parts) + r"(?:.*)?$"
+
+
+def _clean_groupdict(gd: dict) -> dict:
+    """Strip incidental leading/trailing whitespace left over from a
+    free-text capture stopping right at a separator boundary."""
+    return {k: (v.strip() if isinstance(v, str) else v) for k, v in gd.items()}
 
 
 def _test_pattern(pattern: str, files: list[Path]) -> list[dict]:
@@ -783,7 +817,7 @@ def _test_pattern(pattern: str, files: list[Path]) -> list[dict]:
     results = []
     for f in files[:5]:
         m = rx.match(f.stem)
-        results.append({"file": f.name, "match": m.groupdict() if m else None})
+        results.append({"file": f.name, "match": _clean_groupdict(m.groupdict()) if m else None})
     return results
 
 
@@ -901,7 +935,7 @@ def _preview_lines(pattern: str, fmt: str, season: int, files: list[Path], n: in
     for f in files[:n]:
         m = rx.match(f.stem)
         if m:
-            out = _apply_output_fmt(fmt, m.groupdict(), season) + f.suffix.lower()
+            out = _apply_output_fmt(fmt, _clean_groupdict(m.groupdict()), season) + f.suffix.lower()
             lines.append(f"{DIM}{f.name[:42]}{'…' if len(f.name)>42 else ''}{R}")
             lines.append(f"  {GREEN}→ {out}{R}")
     return lines
@@ -1045,7 +1079,7 @@ def _builder_step_blocks(files: list[Path], state: BuildState) -> None:
                 rx  = re.compile(pat, re.IGNORECASE)
                 m   = rx.match(Path(state.sample).stem)
                 if m:
-                    gd = m.groupdict()
+                    gd = _clean_groupdict(m.groupdict())
                     print(f"  {GREEN}✓ matches:{R}  " +
                           "  ".join(f"{DIM}{k}{R}={GREEN}{v}{R}" for k, v in gd.items() if v))
                 else:
@@ -1259,7 +1293,7 @@ def flow_regex_builder(files: list[Path], show: str, season: int, folder: Path):
         m = rx_final.match(f.stem)
         if not m:
             return None
-        gd = m.groupdict()
+        gd = _clean_groupdict(m.groupdict())
         if final_show:
             gd["show"] = final_show
         return _apply_output_fmt(final_output_fmt, gd, final_season) + f.suffix.lower()
@@ -1324,9 +1358,95 @@ ANCHOR_PATTERNS = {
     "quality": re.compile(r"^\d{3,4}p$", re.IGNORECASE),
 }
 
+# Prefix-only variants (no trailing $) used only to detect an anchor
+# that's been fused with extra trailing text inside the same token, e.g.
+# 'S01E02-name' when split on spaces — 'name' has no separator from the
+# anchor. These are intentionally separate from ANCHOR_PATTERNS above,
+# which must stay strict full-token matches for extract_with_recipe's
+# anchor search to avoid false positives.
+ANCHOR_PREFIX_PATTERNS = {
+    "se":      re.compile(r"^[Ss]\d{1,2}[Ee]\d{1,3}(?:[vV]\d+)?"),
+    "season":  re.compile(r"^[Ss]\d{1,2}(?:[vV]\d+)?"),
+    "ep":      re.compile(r"^\d{1,4}(?:[vV]\d+)?"),
+    "quality": re.compile(r"^\d{3,4}p", re.IGNORECASE),
+}
+
 # Keys that are NOT free-position text — i.e. found by pattern matching,
 # not by gap-filling between other anchors.
 FIXED_ANCHOR_KEYS = set(ANCHOR_PATTERNS.keys())
+
+
+def _split_fused_anchors_list(tokens: list[str], skip: set[str] = None) -> list[str]:
+    """
+    Plain-text version of the fused-anchor fix-up, shared by SplitState
+    (used live while labelling) and extract_with_recipe (used when the
+    recipe is replayed against other files in the batch) — so a token
+    like 'S01E02-name' always gets split into 'S01E02' + '-name' the
+    same way, no matter which file it came from.
+
+    A token that already fully matches a recognised anchor on its own
+    (e.g. a clean 'S01E07' token from a dot-separated filename) is left
+    completely untouched — splitting is only attempted when NO pattern
+    matches the whole token. When a split is needed, the LONGEST partial
+    match wins (so 'S01E02-name' splits on the full 'se' pattern, not
+    the shorter 'season' prefix 'S01').
+    """
+    skip = skip or set()
+    new_tokens: list[str] = []
+    for tok in tokens:
+        if tok in skip:
+            new_tokens.append(tok)
+            continue
+
+        # If the whole token already matches some anchor exactly, it's
+        # already clean — never touch it.
+        if any(full_pat.match(tok) for full_pat in ANCHOR_PATTERNS.values()):
+            new_tokens.append(tok)
+            continue
+
+        # Otherwise, find the longest partial-prefix match across all
+        # anchor patterns and split there.
+        best_end = 0
+        for pat in ANCHOR_PREFIX_PATTERNS.values():
+            m = pat.match(tok)
+            if m and m.end() > best_end:
+                best_end = m.end()
+
+        if 0 < best_end < len(tok):
+            new_tokens.append(tok[:best_end])
+            leftover = tok[best_end:]
+            if leftover:
+                new_tokens.append(leftover)
+        else:
+            new_tokens.append(tok)
+    return new_tokens
+
+
+def _is_pure_literal(text: str) -> bool:
+    """True if text has no letters or digits — i.e. it's pure punctuation
+    like '[', ']', '-', '(', ')'. These can be re-found in another file
+    by an exact text match rather than treated as ambiguous free text."""
+    return bool(text) and not re.search(r'[a-zA-Z0-9]', text)
+
+
+def _split_bracket_tokens_list(tokens: list[str], skip: set[str] = None) -> list[str]:
+    """
+    Plain-text version of the bracket-splitting fix-up — a token that's
+    entirely wrapped in [ ] or ( ) becomes three separate tokens (open,
+    inner content, close) so the content can be labelled on its own.
+    """
+    skip = skip or set()
+    new_tokens: list[str] = []
+    for tok in tokens:
+        if tok in skip:
+            new_tokens.append(tok)
+            continue
+        m = re.match(r'^(\[|\()(.+)(\]|\))$', tok)
+        if m:
+            new_tokens.extend([m.group(1), m.group(2), m.group(3)])
+        else:
+            new_tokens.append(tok)
+    return new_tokens
 
 
 class Token:
@@ -1371,7 +1491,36 @@ class SplitState:
                 new_tokens.append(tok)
         self.tokens = new_tokens
         self.separator = sep
+
+        # Auto-fix two common fusion problems that would otherwise make
+        # season/episode or bracketed content unrecognisable. These run
+        # on plain text lists (shared with extract_with_recipe) so the
+        # same fix-ups apply identically during interactive labelling
+        # AND when the recipe is replayed against other files later.
+        assigned_texts = {t.text for t in self.tokens if t.key is not None}
+        plain = [t.text for t in self.tokens]
+        plain = _split_fused_anchors_list(plain, skip=assigned_texts)
+        plain = _split_bracket_tokens_list(plain, skip=assigned_texts)
+        self.tokens = [
+            Token(text, None) for text in plain
+        ] if not assigned_texts else self._rebuild_preserving_keys(plain)
         return count
+
+    def _rebuild_preserving_keys(self, plain_texts: list[str]) -> list[Token]:
+        """
+        After re-running the auto-split helpers, rebuild the token list,
+        keeping the key/width of any token whose text didn't change
+        (i.e. it was already labelled and the helpers left it alone).
+        """
+        old_by_text = {t.text: t for t in self.tokens if t.key is not None}
+        rebuilt = []
+        for text in plain_texts:
+            old = old_by_text.get(text)
+            if old is not None:
+                rebuilt.append(old)
+            else:
+                rebuilt.append(Token(text))
+        return rebuilt
 
     def split_token(self, idx: int, sep: str) -> bool:
         tok = self.tokens[idx]
@@ -1480,13 +1629,14 @@ class SplitState:
         return "  ".join(parts) if parts else f"{DIM}(nothing labelled){R}"
 
     def key_order_assigned(self) -> list[str]:
-        """Keys in the order the user assigned them — used to build the recipe."""
-        seen, order = set(), []
-        for t in self.tokens:
-            if t.key and t.key not in seen:
-                seen.add(t.key)
-                order.append(t.key)
-        return order
+        """
+        Keys in the order the user assigned them — used to build the
+        recipe. Every occurrence is kept (not deduplicated): 'skip' in
+        particular is commonly used more than once (e.g. for an opening
+        AND closing bracket), and each occurrence needs to consume its
+        own token slot when the recipe is replayed on other files.
+        """
+        return [t.key for t in self.tokens if t.key]
 
     def key_widths(self) -> dict[str, int]:
         """
@@ -1497,6 +1647,23 @@ class SplitState:
         safely stretch to fill a variable-length gap.
         """
         return {t.key: t.width for t in self.tokens if t.key}
+
+    def literal_anchors(self) -> list[str | None]:
+        """
+        Parallel list to key_order_assigned(), one entry per occurrence.
+        If that occurrence's sample text was pure punctuation (e.g. "[",
+        "]", "-", "(") — i.e. it contains no letters or digits — its
+        exact text is recorded here so it can be RE-FOUND BY EXACT MATCH
+        in other files, the same way se/quality/etc. are found by regex.
+        This is what lets a literal bracket correctly bound a variable-
+        length free-text field next to it, instead of forcing that field
+        into an incorrect fixed width.
+        Non-literal occurrences (actual text/numbers) get None here.
+        """
+        return [
+            t.text if (t.key and _is_pure_literal(t.text)) else None
+            for t in self.tokens if t.key
+        ]
 
 
 def _load_token_patterns() -> dict:
@@ -1581,20 +1748,28 @@ def _apply_resplits(tokens: list[str], resplits: list[dict], key_order: list[str
 
 def extract_with_recipe(stem: str, separator: str, key_order: list[str],
                          key_widths: dict[str, int] = None,
-                         resplits: list[dict] = None) -> dict:
+                         resplits: list[dict] = None,
+                         literal_anchors: list[str | None] = None) -> dict:
     """
     Apply a saved separator + key_order recipe to a new filename stem.
 
-    key_order is the list of keys in the order they were assigned, e.g.
-    ["show", "se", "group", "title", "quality"] — "group" here is a custom
-    field name the user chose, treated exactly like "title": free text,
-    found by the GAP between fixed anchors rather than a fixed position.
+    key_order is the FULL list of labelled occurrences in order, e.g.
+    ["show", "se", "title", "skip", "custom_id", "skip"] — repeated keys
+    (most commonly "skip", used for both an opening and closing bracket)
+    are kept as separate entries, not deduplicated, since each one needs
+    to consume its own token slot when replayed on another file.
 
-    key_widths (token-count per key from the sample) is used only when two
-    free-text keys sit back-to-back with no anchor between them — the
-    earlier one is locked to its sample width so the later one can still
-    absorb a variable-length remainder (e.g. episode titles of differing
-    word counts).
+    literal_anchors is a list the same length as key_order. For any
+    occurrence whose sample text was pure punctuation (e.g. "[", "]",
+    "-"), the corresponding entry holds that exact text — letting it be
+    RE-FOUND BY EXACT MATCH in other files, the same way se/quality are
+    found by regex. This is what correctly bounds a variable-length
+    free-text field sitting next to a literal bracket, without forcing
+    that field into an incorrect fixed width.
+
+    key_widths (token-count per key from the sample) is now only used as
+    a last-resort fallback for two free-text fields directly adjacent
+    with no anchor OR literal between them — a genuinely ambiguous case.
 
     resplits replays any additional 'resplit' operations performed during
     interactive labelling — e.g. splitting a release-tag token further on
@@ -1602,80 +1777,82 @@ def extract_with_recipe(stem: str, separator: str, key_order: list[str],
     that was already assigned at that point.
     """
     key_widths = key_widths or {}
+    literal_anchors = literal_anchors or [None] * len(key_order)
     tokens = stem.split(separator)
+    # Same auto-fix-ups applied live during labelling — keeps replay on
+    # other files in the batch consistent with what the user saw and
+    # labelled in the sample (fused anchors split off, bracket contents
+    # separated out).
+    tokens = _split_fused_anchors_list(tokens)
+    tokens = _split_bracket_tokens_list(tokens)
     tokens = _apply_resplits(tokens, resplits or [], key_order)
     n = len(tokens)
 
-    # Pass 1 — locate every fixed-pattern anchor (se/season/ep/quality) by
-    # regex, walking forward through key_order so duplicates can't collide.
-    anchor_positions: dict[str, int] = {}
+    # Pass 1 — locate every occurrence that's findable by a fixed rule:
+    # either a regex anchor (se/season/ep/quality) or an exact-text
+    # literal anchor (a recorded punctuation token like "[" or "-").
+    # Walk key_order in order so repeated anchors of the same kind can't
+    # collide with each other, and so a literal's position is always
+    # searched for AFTER the previous found anchor, preserving order.
+    occurrence_positions: dict[int, int] = {}   # index into key_order -> token index
     search_cursor = 0
-    for key in key_order:
+    for occ_idx, key in enumerate(key_order):
+        lit = literal_anchors[occ_idx] if occ_idx < len(literal_anchors) else None
         if key in FIXED_ANCHOR_KEYS:
             pat = ANCHOR_PATTERNS[key]
             for i in range(search_cursor, n):
                 if pat.match(tokens[i]):
-                    anchor_positions[key] = i
+                    occurrence_positions[occ_idx] = i
+                    search_cursor = i + 1
+                    break
+        elif lit is not None:
+            for i in range(search_cursor, n):
+                if tokens[i] == lit:
+                    occurrence_positions[occ_idx] = i
                     search_cursor = i + 1
                     break
 
-    # Pass 2 — walk key_order left to right with a cursor. Fixed anchors
-    # consume exactly one token at their found position. "show" and any
-    # free-text key (title, or a custom name) consume from the cursor up
-    # to either: the next fixed anchor's position, or — if back-to-back
-    # with another free key — their own recorded sample width.
+    # Pass 2 — walk key_order left to right with a cursor. Anchored
+    # occurrences (regex or literal) consume exactly one token at their
+    # found position. "show" and any free-text key (title, skip without
+    # a literal, or a custom name) consume from the cursor up to the
+    # next ANCHORED occurrence's position — found anchors always win
+    # over ambiguous width-locking, since they're unambiguous by
+    # construction. Only when no anchored occurrence follows at all do
+    # we fall back to the sample's recorded width.
     result: dict = {}
     cursor = 0
-    for i, key in enumerate(key_order):
-        if key == "skip":
-            # still need to advance the cursor correctly for skip spans;
-            # treat exactly like a free key with no special storage.
-            end = n
-            for later in key_order[i + 1:]:
-                if later in anchor_positions:
-                    end = anchor_positions[later]
-                    break
-            if key in key_widths and key_order[i + 1:i + 2] and key_order[i + 1] not in anchor_positions and key_order[i+1] != "show":
-                end = min(cursor + key_widths[key], end)
-            cursor = max(end, cursor)
-            continue
-
-        if key == "show":
-            nxt = key_order[i + 1] if i + 1 < len(key_order) else None
-            end = anchor_positions.get(nxt, n) if nxt else n
-            if end > cursor:
-                result["show"] = " ".join(tokens[cursor:end])
-            cursor = end
-            continue
-
-        if key in anchor_positions:
-            idx = anchor_positions[key]
+    for occ_idx, key in enumerate(key_order):
+        if occ_idx in occurrence_positions:
+            idx = occurrence_positions[occ_idx]
             if key == "se":
                 m = re.match(r'[Ss](\d{1,2})[Ee](\d{1,3})', tokens[idx])
                 if m:
                     result["season"] = m.group(1)
                     result["ep"]     = m.group(2)
-            else:
+            elif key not in ("skip",):
                 result[key] = tokens[idx]
             cursor = idx + 1
             continue
 
-        # Free-text key (built-in "title" or any custom name).
-        nxt = key_order[i + 1] if i + 1 < len(key_order) else None
-        next_is_free = nxt is not None and nxt not in anchor_positions and nxt != "show"
-        if next_is_free and key in key_widths:
-            # locked width so the key AFTER this one can absorb the
-            # variable remainder
-            end = min(cursor + key_widths[key], n)
-        else:
-            end = n
-            for later in key_order[i + 1:]:
-                if later in anchor_positions:
-                    end = anchor_positions[later]
-                    break
-        if end > cursor:
-            result[key] = " ".join(tokens[cursor:end])
-        cursor = end
+        # Not directly anchored — consume up to the next anchored
+        # occurrence (by token position), or to the sample width if no
+        # later occurrence is anchored at all.
+        end = None
+        for later_idx in range(occ_idx + 1, len(key_order)):
+            if later_idx in occurrence_positions:
+                end = occurrence_positions[later_idx]
+                break
+        if end is None:
+            end = min(cursor + key_widths.get(key, n - cursor), n)
+
+        if key == "show":
+            if end > cursor:
+                result["show"] = re.sub(r'^[\s\-_.]+', '', " ".join(tokens[cursor:end]))
+        elif key != "skip" and end > cursor:
+            result[key] = re.sub(r'^[\s\-_.]+', '', " ".join(tokens[cursor:end]))
+
+        cursor = max(end, cursor)
 
     return result
 
@@ -1683,10 +1860,11 @@ def extract_with_recipe(stem: str, separator: str, key_order: list[str],
 def _preview_token_lines(stem: str, separator: str, key_order: list[str],
                           fmt: str, season: int, files: list[Path], n: int = 3,
                           key_widths: dict[str, int] = None,
-                          resplits: list[dict] = None) -> list[str]:
+                          resplits: list[dict] = None,
+                          literal_anchors: list = None) -> list[str]:
     lines = []
     for f in files[:n]:
-        groups = extract_with_recipe(f.stem, separator, key_order, key_widths, resplits)
+        groups = extract_with_recipe(f.stem, separator, key_order, key_widths, resplits, literal_anchors)
         if not groups:
             continue
         out = _apply_output_fmt(fmt, groups, season) + f.suffix.lower()
@@ -1877,9 +2055,10 @@ def _splitter_step_assign(sample: str, state: SplitState) -> None:
 
 def _splitter_step_test(files: list[Path], sample: str, state: SplitState) -> list[str]:
     """Step 4: confirm the labelling reproduces correctly across the batch."""
-    key_order  = state.key_order_assigned()
-    key_widths = state.key_widths()
-    resplits   = state.resplits
+    key_order       = state.key_order_assigned()
+    key_widths      = state.key_widths()
+    resplits        = state.resplits
+    literal_anchors = state.literal_anchors()
     while True:
         render(
             title="Step 4/5 — Check it against your files",
@@ -1888,7 +2067,8 @@ def _splitter_step_test(files: list[Path], sample: str, state: SplitState) -> li
         print(f"  {BOLD}Re-applying your labels to each file:{R}")
         any_fail = False
         for f in files[:5]:
-            groups = extract_with_recipe(f.stem, state.separator, key_order, key_widths, resplits)
+            groups = extract_with_recipe(f.stem, state.separator, key_order, key_widths,
+                                          resplits, literal_anchors)
             if groups.get("ep") or groups.get("season"):
                 shown = "  ".join(f"{DIM}{k}{R}={CYAN}{v}{R}" for k, v in groups.items())
                 print(f"  {GREEN}✓{R} {DIM}{f.name}{R}")
@@ -1911,10 +2091,11 @@ def _splitter_step_test(files: list[Path], sample: str, state: SplitState) -> li
 
 def _splitter_step_output(files: list[Path], sample: str, state: SplitState,
                            key_order: list[str], season: int) -> str:
-    key_widths = state.key_widths()
-    resplits   = state.resplits
+    key_widths      = state.key_widths()
+    resplits        = state.resplits
+    literal_anchors = state.literal_anchors()
     captured = set(extract_with_recipe(Path(sample).stem, state.separator, key_order,
-                                        key_widths, resplits).keys())
+                                        key_widths, resplits, literal_anchors).keys())
     fmt_override = None
     while True:
         render(
@@ -1924,7 +2105,8 @@ def _splitter_step_output(files: list[Path], sample: str, state: SplitState,
         )
         fmt = _build_output_fmt(captured, default_suggestion=fmt_override)
         preview = _preview_token_lines(sample, state.separator, key_order, fmt, season, files,
-                                        n=3, key_widths=key_widths, resplits=resplits)
+                                        n=3, key_widths=key_widths, resplits=resplits,
+                                        literal_anchors=literal_anchors)
         if preview:
             blank()
             print(f"  {BOLD}Preview:{R}")
@@ -1968,17 +2150,20 @@ def flow_token_splitter(files: list[Path], show: str, season: int, folder: Path)
 
     key_widths: dict[str, int] = {}
     resplits: list[dict] = []
+    literal_anchors: list = []
 
     if saved_recipe:
-        separator  = saved_recipe["separator"]
-        key_order  = saved_recipe["key_order"]
-        output_fmt = saved_recipe["output_fmt"]
-        key_widths = saved_recipe.get("key_widths", {})
-        resplits   = saved_recipe.get("resplits", [])
+        separator       = saved_recipe["separator"]
+        key_order       = saved_recipe["key_order"]
+        output_fmt      = saved_recipe["output_fmt"]
+        key_widths      = saved_recipe.get("key_widths", {})
+        resplits        = saved_recipe.get("resplits", [])
+        literal_anchors = saved_recipe.get("literal_anchors", [])
         render(title="Loaded pattern",
                context_lines=[f"Separator: {DIM}\"{separator}\"{R}", f"Output: {DIM}{output_fmt}{R}"])
         for f in files[:5]:
-            groups = extract_with_recipe(f.stem, separator, key_order, key_widths, resplits)
+            groups = extract_with_recipe(f.stem, separator, key_order, key_widths,
+                                          resplits, literal_anchors)
             status = "✓" if (groups.get("ep") or groups.get("season")) else "✗"
             col = GREEN if status == "✓" else RED
             print(f"  {col}{status}{R} {DIM}{f.name}{R}")
@@ -2009,19 +2194,21 @@ def flow_token_splitter(files: list[Path], show: str, season: int, folder: Path)
             except Back:
                 step = max(1, step - 1)
 
-        key_widths = state.key_widths()
-        resplits   = state.resplits
+        key_widths      = state.key_widths()
+        resplits        = state.resplits
+        literal_anchors = state.literal_anchors()
 
         render(title="Save for next time?",
                context_lines=[f"Labels: {state.summary_line()}"])
         if ask_yn("Save this pattern?", default_yes=True):
             pname = ask("Name", default=show or "my-pattern")
             _save_token_pattern(pname, {
-                "separator":  state.separator,
-                "key_order":  key_order,
-                "output_fmt": output_fmt,
-                "key_widths": key_widths,
-                "resplits":   resplits,
+                "separator":       state.separator,
+                "key_order":       key_order,
+                "output_fmt":      output_fmt,
+                "key_widths":      key_widths,
+                "resplits":        resplits,
+                "literal_anchors": literal_anchors,
             })
         separator = state.separator
 
@@ -2036,7 +2223,8 @@ def flow_token_splitter(files: list[Path], show: str, season: int, folder: Path)
     )
 
     def build(f, i):
-        groups = extract_with_recipe(f.stem, separator, key_order, key_widths, resplits)
+        groups = extract_with_recipe(f.stem, separator, key_order, key_widths,
+                                      resplits, literal_anchors)
         if not (groups.get("ep") or groups.get("season")):
             return None
         if final_show:
