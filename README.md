@@ -1,20 +1,36 @@
 # Media Batch Renamer
 
-A terminal tool for batch-renaming anime/TV episode files on Linux into clean,
+A terminal tool for batch-renaming anime/TV episode files into clean,
 consistent names like `Show Name - S01E01 - Episode Title.mkv` — and for
 keeping a season's folder structure tidy as new episodes come in. Built for
 people with messy fansub/release-group filenames who want a fast, repeatable
-way to clean them up, no scripting required.
+way to clean them up, no scripting required. Runs on **Linux, macOS, and
+Windows**.
+
+### Linux / macOS
 
 ```bash
 chmod +x rename_media.py
 ./rename_media.py
 ```
 
-You can also pass a starting folder directly:
+### Windows
+
+```powershell
+python rename_media.py
+```
+
+Works in Windows Terminal, PowerShell, or `cmd.exe`. Colours are enabled
+automatically wherever possible — on older consoles that don't support them
+out of the box, the script turns on the required mode itself at startup.
+
+### Starting from a folder directly (any OS)
 
 ```bash
 ./rename_media.py /path/to/your/show
+```
+```powershell
+python rename_media.py C:\path\to\your\show
 ```
 
 The main menu will show **"Starting folder ready"** when one is waiting, and
@@ -23,6 +39,24 @@ directly — say yes to skip the picker, or no to browse normally. It's only
 offered once per run.
 
 Requires Python 3.10+ (standard library only — no extra packages to install).
+
+---
+
+## Platform support
+
+The tool detects which OS it's running on and adapts automatically — there's
+nothing to configure.
+
+| | Linux / macOS | Windows |
+|---|---|---|
+| **Folder picker — local** | Home, Videos/Downloads/Documents/Music/Pictures, anything under `/media` or `/mnt` | Home, Videos/Downloads/Documents/Music/Pictures, every drive letter (`C:\`, `D:\`, …) |
+| **Folder picker — network** | SMB/FTP/SFTP/MTP shares mounted through Nautilus ("Files") are auto-detected | Map a network drive to a letter first, then it's picked up the same as any other drive — UNC paths (`\\server\share`) can be typed in directly |
+| **Colours** | Work out of the box in any terminal | Enabled automatically at startup, including on older `cmd.exe`/PowerShell consoles that don't have ANSI support on by default |
+| **Saved patterns location** | `~/.config/rename_media/` | `%APPDATA%\rename_media\` |
+| **Filenames** | Any character your filesystem allows | Characters that are illegal on Windows (`< > : " \| ? *`) are automatically stripped from generated filenames, and trailing dots/spaces are trimmed — so a title like `Title: Part Two` becomes `Title Part Two` only on Windows; Linux/macOS keep the colon since it's valid there |
+
+Everything else — the rename modes, the builders, the season utilities, the
+show-name confirmation — behaves identically on every platform.
 
 ---
 
@@ -66,11 +100,19 @@ don't need to remember what each one does:
 When asked for a folder, you'll see:
 
 - **Local locations** — your home directory, Videos/Downloads/Documents/Music/
-  Pictures (read from your desktop's actual folder settings if available),
-  and anything mounted under `/media` or `/mnt` (USB drives, etc.)
-- **Network shares** — any SMB/FTP/SFTP/MTP share currently mounted through
-  Nautilus ("Files"), shown with a readable name like `nas / media (SMB)`
-  instead of the raw mount path
+  Pictures (read from your desktop's actual folder settings on Linux/macOS
+  if available; standard folder names under your home directory on Windows),
+  and:
+  - **Linux/macOS:** anything mounted under `/media` or `/mnt` (USB drives,
+    etc.)
+  - **Windows:** every drive letter currently available (`C:\`, `D:\`, a
+    mapped network drive, a USB stick, etc.)
+- **Network shares** (Linux/macOS only, shown automatically) — any SMB/FTP/
+  SFTP/MTP share currently mounted through Nautilus ("Files"), shown with a
+  readable name like `nas / media (SMB)` instead of the raw mount path. On
+  Windows, map the network share to a drive letter first (or just type the
+  UNC path directly, e.g. `\\nas\media`) and it works the same as any local
+  folder.
 
 Pick a number to browse into that location, or just paste/type any path
 directly — including drag-and-drop from a file manager. Once inside a
@@ -200,7 +242,8 @@ what your actual files will be renamed to before confirming.
 You can save the whole recipe (parts + output format) under a name of your
 choice. Next time you pick Mode 6, choosing "Load a saved pattern" skips
 straight to a dry run — no rebuilding needed. Saved patterns live in
-`~/.config/rename_media/patterns.json`.
+`patterns.json` under the config folder for your OS (see
+[Platform support](#platform-support) above).
 
 ---
 
@@ -339,8 +382,8 @@ show up as their own tokens (e.g. `{group}`):
 Blue Box - S01E07 - Can I Have One (1080p).mkv
 ```
 
-Patterns built in Mode 7 save separately from Mode 6, at
-`~/.config/rename_media/token_patterns.json`.
+Patterns built in Mode 7 save separately from Mode 6, in
+`token_patterns.json` under the same config folder.
 
 ---
 
@@ -413,7 +456,11 @@ no files changed.
   episodes and define ranges like `1-12`, `13-24`, `25-36`. Each range
   becomes its own `Season NN/` folder, with episodes renumbered starting
   from 1 within that season (so absolute episode 25 becomes `S03E01`).
-  Warns about overlapping ranges and any episodes left uncovered.
+  Each range must start right after the previous one ends, and none can go
+  beyond the highest episode actually found in the folder — both are
+  checked and rejected immediately if you try. Type `undo` (or `b`) to
+  remove the last range you entered and try again without losing the
+  others; `b` only exits the whole utility if nothing's been entered yet.
 
 The last three utilities (Overwrite, Renumber/Move, Split By Range) all end
 with the same **typed show-name confirmation** as the rename modes. The show
@@ -425,7 +472,7 @@ metadata tags media servers like Plex/Jellyfin commonly add:
 Attack on Titan (2013) {tvdb-267440}/Season 02   →   confirms as "Attack on Titan"
 Spy x Family (2022) [tmdbid-120089]/S01/S02      →   confirms as "Spy x Family"
 ```
-
+ 
 ---
 
 ## Supported file types
@@ -440,6 +487,10 @@ Spy x Family (2022) [tmdbid-120089]/S01/S02      →   confirms as "Spy x Family
   *and* pass the typed show-name confirmation.
 - Episode numbering in the season utilities always starts at 1, never 0,
   even if a file in the folder happens to start at episode 0.
-- Saved Mode 6 patterns live at `~/.config/rename_media/patterns.json`.
-- Saved Mode 7 patterns live at `~/.config/rename_media/token_patterns.json`.
-  Both are plain JSON and can be inspected, backed up, or hand-edited.
+- Saved Mode 6 patterns live in `patterns.json`, and Mode 7 patterns in
+  `token_patterns.json`, both under the config folder for your OS (see
+  [Platform support](#platform-support)). Both are plain JSON and can be
+  inspected, backed up, or hand-edited.
+- On Windows, any character in a generated filename that Windows doesn't
+  allow is silently stripped — you'll never see a failed rename because of
+  it. Linux and macOS allow those characters, so nothing is changed there.

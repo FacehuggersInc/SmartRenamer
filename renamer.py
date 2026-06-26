@@ -10,6 +10,26 @@ import json
 import shutil
 from pathlib import Path
 
+# ─── Windows console setup ────────────────────────────────────────────────────
+# Modern Windows Terminal and PowerShell 7+ already render ANSI escape codes
+# correctly. Older consoles (legacy cmd.exe, PowerShell 5) need VT100 mode
+# explicitly turned on via the Windows API, or every colour code below would
+# print as literal garbage like "←[1m" instead of being interpreted.
+if os.name == "nt":
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        STD_OUTPUT_HANDLE = -11
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+    except Exception:
+        # If this fails for any reason, the script still runs — colours
+        # just won't render correctly on that particular console.
+        pass
+
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
 R      = "\033[0m"
 BOLD   = "\033[1m"
@@ -101,6 +121,9 @@ def section(title: str):
 
 # ─── Location discovery (local dirs + GVFS/SMB mounts) ───────────────────────
 
+IS_WINDOWS = (os.name == "nt")
+
+
 def _find_all_locations() -> list[tuple[str, Path]]:
     locations: list[tuple[str, Path]] = []
     seen: set[Path] = set()
@@ -113,6 +136,29 @@ def _find_all_locations() -> list[tuple[str, Path]]:
     home = Path.home()
     add("Home", home)
 
+    if IS_WINDOWS:
+        # Windows: standard user folders live directly under the home
+        # directory (no XDG config to read), and the equivalent of
+        # "other mounted locations" is enumerating drive letters.
+        for name in ("Videos", "Downloads", "Documents", "Music", "Pictures"):
+            add(name, home / name)
+
+        import string
+        for letter in string.ascii_uppercase:
+            drive = Path(f"{letter}:\\")
+            if drive.is_dir():
+                # Skip the drive the OS itself lives on if it's just "C:\"
+                # with nothing else interesting at the top level — still
+                # list it, just don't treat it specially.
+                label = f"{letter}: drive"
+                add(label, drive)
+
+        # Windows network shares (mapped drive letters already covered
+        # above; UNC paths like \\server\share aren't auto-discoverable
+        # the way GVFS mounts are, so they're typed in manually instead).
+        return locations
+
+    # ── POSIX (Linux/macOS) below ──────────────────────────────────────────────
     WANT_XDG = {
         "XDG_VIDEOS_DIR": "Videos", "XDG_DOWNLOAD_DIR": "Downloads",
         "XDG_DOCUMENTS_DIR": "Documents", "XDG_MUSIC_DIR": "Music",
@@ -359,7 +405,46 @@ def clean_title(s: str) -> str:
     s = s.replace("_", " ").replace(".", " ")
     return re.sub(r'\s+', ' ', s).strip(" -")
 
+# Characters that are illegal in filenames on Windows (NTFS/FAT). These are
+# all valid on Linux, so this is only ever applied when running on Windows —
+# Linux filenames pass through untouched.
+_WINDOWS_ILLEGAL_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
+
+def sanitize_filename(name: str) -> str:
+    """
+    Make a full filename (including its real extension, e.g. "Show.mkv")
+    safe to create on the current OS. On Windows this strips characters
+    that are illegal in NTFS/FAT filenames and trims trailing dots/
+    spaces. On Linux/macOS this is a no-op.
+    """
+    if not IS_WINDOWS:
+        return name
+    # Preserve the extension separately so trimming trailing dots/spaces
+    # doesn't accidentally eat into ".mkv" etc. Only treat the suffix as
+    # a real extension if it's short and alphanumeric — otherwise (no
+    # extension at all, or a dot that's actually part of the title, like
+    # "Mr. Smith") just sanitize the whole string as one piece.
+    stem, _, ext = name.rpartition(".")
+    if stem and re.fullmatch(r'[A-Za-z0-9]{1,5}', ext):
+        stem = _WINDOWS_ILLEGAL_CHARS.sub("", stem).rstrip(". ")
+        return f"{stem}.{ext}"
+    return _WINDOWS_ILLEGAL_CHARS.sub("", name).rstrip(". ")
+
+
+def sanitize_filename_part(name: str) -> str:
+    """
+    Make a filename FRAGMENT (no extension involved at all — e.g. the
+    output of _apply_output_fmt before ".mkv" is appended) safe on the
+    current OS. Unlike sanitize_filename, this never tries to guess at
+    an extension — any dot in the string is just part of the title.
+    """
+    if not IS_WINDOWS:
+        return name
+    return _WINDOWS_ILLEGAL_CHARS.sub("", name).rstrip(". ")
+
+
 def safe_rename(src: Path, dst: Path, dry_run: bool) -> bool:
+    dst = dst.with_name(sanitize_filename(dst.name))
     if dst.exists() and dst != src:
         warn(f"SKIP — exists: {dst.name}")
         return False
@@ -740,7 +825,20 @@ def flow_custom_regex(files, show, season, folder):
 # like "regex" and "capture group" stays out of user-facing text wherever
 # possible — it's framed as "parts of the filename" throughout.
 
-PATTERNS_FILE = Path.home() / ".config" / "rename_media" / "patterns.json"
+def _config_dir() -> Path:
+    """
+    Where this tool stores its saved patterns. Uses the conventional
+    location on each OS: %APPDATA%\\rename_media on Windows,
+    ~/.config/rename_media on Linux/macOS.
+    """
+    if IS_WINDOWS:
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+        return base / "rename_media"
+    return Path.home() / ".config" / "rename_media"
+
+
+PATTERNS_FILE = _config_dir() / "patterns.json"
 
 CAPTURE_BLOCKS = {
     "show":    {"label": "Show name",        "regex": r"(?P<show>.+?)",
@@ -941,7 +1039,7 @@ def _apply_output_fmt(fmt: str, groups: dict, season_override: int) -> str:
             out = out.replace(token, str(value).strip())
     out    = re.sub(r'  +', ' ', out).strip(" -–")
     out    = re.sub(r'\s+-\s*$', '', out).strip()
-    return out
+    return sanitize_filename_part(out)
 
 
 def _preview_lines(pattern: str, fmt: str, season: int, files: list[Path], n: int = 3) -> list[str]:
@@ -1333,7 +1431,7 @@ def flow_regex_builder(files: list[Path], show: str, season: int, folder: Path):
 # batch, so a different title word-count per episode doesn't break it —
 # the gap between two recognised anchors becomes the title automatically.
 
-TOKEN_PATTERNS_FILE = Path.home() / ".config" / "rename_media" / "token_patterns.json"
+TOKEN_PATTERNS_FILE = _config_dir() / "token_patterns.json"
 
 TOKEN_KEYS = {
     "show":    "Show name",
@@ -2325,7 +2423,7 @@ def util_rename_show(folder: Path):
     for f in files:
         if f.stem.startswith(old_name):
             rest = f.stem[len(old_name):]
-            pairs.append((f, folder / (new_name + rest + f.suffix.lower())))
+            pairs.append((f, folder / sanitize_filename(new_name + rest + f.suffix.lower())))
 
     if not pairs:
         warn(f"No files start with \"{old_name}\".")
