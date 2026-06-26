@@ -496,6 +496,66 @@ def run_rename(files, folder, dry_run, build_fn):
     return ok, skip
 
 
+def _confirm_show_name(files: list[Path], folder: Path, build_fn) -> bool:
+    """
+    Final safety gate before any real rename happens. Shows the show name
+    that will actually be used (taken from a live preview of the first
+    file's new name, not just whatever was typed earlier — some modes let
+    the show name be overridden deep in their own settings) and requires
+    the user to type it back exactly before proceeding. Returns True only
+    on an exact match; any mismatch or blank input cancels.
+    """
+    if not files:
+        return False
+
+    preview_name = build_fn(files[0], 1)
+    if preview_name is None:
+        # fall back to trying a few more files in case the first one
+        # legitimately doesn't match the pattern
+        for f in files[1:5]:
+            preview_name = build_fn(f, 1)
+            if preview_name is not None:
+                break
+
+    detected_show = ""
+    if preview_name:
+        # the show name is everything before the first " - " separator
+        # in the standard output convention used across all modes
+        m = re.match(r'^(.+?)\s+-\s+', preview_name)
+        if m:
+            detected_show = m.group(1)
+
+    render(title="Final confirmation",
+           context_lines=[f"About to rename {BOLD}{len(files)}{R} file(s) in:",
+                           f"{DIM}{folder}{R}"])
+
+    if detected_show:
+        print(f"  The show name in the new filenames will be:")
+        blank()
+        print(f"    {BOLD}{CYAN}{detected_show}{R}")
+        blank()
+        print(f"  {DIM}Type it exactly as shown above to confirm and rename for real.{R}")
+        print(f"  {DIM}Anything else cancels — no files will be changed.{R}")
+    else:
+        warn("Could not detect a show name from the preview.")
+        print(f"  {DIM}Type 'CONFIRM' to proceed anyway, or anything else to cancel.{R}")
+        detected_show = "CONFIRM"
+
+    blank()
+    typed = input(f"  {BOLD}Confirm{R}: ").strip()
+
+    if typed == detected_show:
+        success("Confirmed.")
+        return True
+
+    if typed:
+        err(f"\"{typed}\" doesn't match \"{detected_show}\" — cancelled, no files changed.")
+    else:
+        info("Cancelled — no files changed.")
+    input("  Press Enter to continue...")
+    return False
+
+
 # ─── Simple flows (modes 1–4) ─────────────────────────────────────────────────
 
 def flow_fansub(files, show, season, folder):
@@ -785,14 +845,19 @@ OUTPUT_TOKENS = {
     "{show}": "Show name", "{SE}": "S01E01", "{S}": "S01",
     "{E}": "E01", "{title}": "title", "{quality}": "1080p",
 }
+BUILT_IN_GROUP_KEYS = {"show", "season", "ep", "title", "quality"}
 
 def _build_output_fmt(captured_groups: set[str], default_suggestion: str = None) -> str:
-    print(f"  {BOLD}Tokens:{R}  " + "  ".join(
-        f"{CYAN}{t}{R}{DIM}={d}{R}" for t, d in OUTPUT_TOKENS.items()
-    ))
+    custom_keys = sorted(captured_groups - BUILT_IN_GROUP_KEYS)
+    shown = "  ".join(f"{CYAN}{t}{R}{DIM}={d}{R}" for t, d in OUTPUT_TOKENS.items())
+    if custom_keys:
+        shown += "  " + "  ".join(f"{CYAN}{{{k}}}{R}{DIM}=your custom field{R}" for k in custom_keys)
+    print(f"  {BOLD}Tokens:{R}  {shown}")
     blank()
     suggestion = default_suggestion or "{show} - {SE}"
     if default_suggestion is None:
+        for k in custom_keys:
+            suggestion += f" {{{k}}}"
         if "title"   in captured_groups: suggestion += " - {title}"
         if "quality" in captured_groups: suggestion += " ({quality})"
     fmt = ask("New filename format", default=suggestion)
@@ -810,6 +875,14 @@ def _apply_output_fmt(fmt: str, groups: dict, season_override: int) -> str:
     out    = out.replace("{title}",   groups.get("title", "").strip())
     q      = groups.get("quality", "")
     out    = out.replace("{quality}", q if q else "")
+    # any other captured key (custom fields) substitutes the same way —
+    # e.g. {group} for a custom field named "group"
+    for key, value in groups.items():
+        if key in ("show", "season", "ep", "title", "quality"):
+            continue
+        token = "{" + key + "}"
+        if token in out:
+            out = out.replace(token, str(value).strip())
     out    = re.sub(r'  +', ' ', out).strip(" -–")
     out    = re.sub(r'\s+-\s*$', '', out).strip()
     return out
@@ -1191,6 +1264,710 @@ def flow_regex_builder(files: list[Path], show: str, season: int, folder: Path):
     return build
 
 
+# ─── Token Splitter Builder (Mode 7) ──────────────────────────────────────────
+#
+# An alternative to Mode 6 for filenames where fields aren't separated by
+# recognisable words/brackets — e.g. dot-bombed release names like
+# "Blue.Box.S01E07.Can.I.Have.One.1080p.NF.WEB-DL.DUAL.DDP5.1.H.264-VARYG".
+#
+# Approach: pick a separator, split the whole filename into indexed tokens,
+# then assign each token (or a range) to a key by typing the key then an
+# index or index range. Recognisable keys (se, season, ep, quality) are
+# re-found by PATTERN when the recipe is applied to other files in the
+# batch, so a different title word-count per episode doesn't break it —
+# the gap between two recognised anchors becomes the title automatically.
+
+TOKEN_PATTERNS_FILE = Path.home() / ".config" / "rename_media" / "token_patterns.json"
+
+TOKEN_KEYS = {
+    "show":    "Show name",
+    "se":      "Season+Episode combined (e.g. S01E07)",
+    "season":  "Season number only",
+    "ep":      "Episode number only",
+    "title":   "Episode title",
+    "quality": "Quality / resolution",
+    "custom":  "Custom field — you name it (e.g. group, codec, audio)",
+    "skip":    "Ignore — not used in the new filename",
+}
+TOKEN_KEY_ORDER = ["show", "se", "season", "ep", "title", "quality", "custom", "skip"]
+
+KEY_COLORS = {
+    "show": MAGENTA, "season": BLUE, "ep": CYAN, "se": CYAN,
+    "title": GREEN, "quality": RED, "skip": DIM,
+}
+
+CUSTOM_KEY_PALETTE = [
+    "\033[38;5;208m",  # orange
+    "\033[38;5;141m",  # purple
+    "\033[38;5;44m",   # teal
+    "\033[38;5;220m",  # gold
+    "\033[38;5;204m",  # pink
+    "\033[38;5;120m",  # light green
+]
+
+def _key_color(key: str) -> str:
+    """Stable colour for a key name. Built-ins use KEY_COLORS; any other
+    name (i.e. a custom field) gets a deterministic colour from a separate
+    palette so it never collides with a built-in colour."""
+    if key in KEY_COLORS:
+        return KEY_COLORS[key]
+    idx = sum(ord(c) for c in key) % len(CUSTOM_KEY_PALETTE)
+    return CUSTOM_KEY_PALETTE[idx]
+
+ANCHOR_PATTERNS = {
+    "se":      re.compile(r"^[Ss]\d{1,2}[Ee]\d{1,3}$"),
+    "season":  re.compile(r"^[Ss]\d{1,2}$"),
+    "ep":      re.compile(r"^\d{1,4}$"),
+    "quality": re.compile(r"^\d{3,4}p$", re.IGNORECASE),
+}
+
+# Keys that are NOT free-position text — i.e. found by pattern matching,
+# not by gap-filling between other anchors.
+FIXED_ANCHOR_KEYS = set(ANCHOR_PATTERNS.keys())
+
+
+class Token:
+    __slots__ = ("text", "key", "width")
+    def __init__(self, text: str, key: str | None = None, width: int = 1):
+        self.text  = text
+        self.key   = key
+        self.width = width   # number of original tokens this merged token represents
+
+
+class SplitState:
+    def __init__(self, stem: str):
+        self.stem = stem
+        self.tokens: list[Token] = [Token(stem)]
+        self.output_fmt: str = ""
+        self.separator: str = ""
+        self._history: list[list[Token]] = []   # undo stack of token snapshots
+
+    def _snapshot(self) -> None:
+        self._history.append([Token(t.text, t.key, t.width) for t in self.tokens])
+
+    def undo(self) -> bool:
+        if not self._history:
+            return False
+        self.tokens = self._history.pop()
+        return True
+
+    def split_all(self, sep: str) -> int:
+        self._snapshot()
+        new_tokens, count = [], 0
+        for tok in self.tokens:
+            if tok.key is None and sep in tok.text:
+                new_tokens.extend(Token(p) for p in tok.text.split(sep))
+                count += 1
+            else:
+                new_tokens.append(tok)
+        self.tokens = new_tokens
+        self.separator = sep
+        return count
+
+    def split_token(self, idx: int, sep: str) -> bool:
+        tok = self.tokens[idx]
+        if sep not in tok.text:
+            return False
+        self._snapshot()
+        pieces = [Token(p) for p in tok.text.split(sep)]
+        self.tokens[idx:idx+1] = pieces
+        return True
+
+    def assign(self, start: int, end: int, key: str, joiner: str = " ") -> None:
+        self._snapshot()
+        merged_text = joiner.join(t.text for t in self.tokens[start:end+1])
+        width = end - start + 1
+        self.tokens[start:end+1] = [Token(merged_text, key, width)]
+
+    def unassign(self, idx: int) -> None:
+        self._snapshot()
+        self.tokens[idx].key = None
+
+    def extract(self) -> dict:
+        result = {}
+        for t in self.tokens:
+            if t.key in (None, "skip"):
+                continue
+            if t.key == "se":
+                m = re.match(r'[Ss](\d{1,2})[Ee](\d{1,3})', t.text)
+                if m:
+                    result["season"] = m.group(1)
+                    result["ep"]     = m.group(2)
+            else:
+                result[t.key] = t.text
+        return result
+
+    def column_rows(self, max_width: int = 70) -> list[str]:
+        """
+        Build a clear 3-row display: index numbers, token text, and a
+        [label] tag directly underneath each labelled token — wrapped to
+        max_width so it doesn't overflow narrow terminals. Colour is used
+        as a secondary cue on top of the explicit [label] text, not the
+        only signal.
+        """
+        cols = []
+        for i, t in enumerate(self.tokens):
+            idx_str   = str(i)
+            label_str = f"[{t.key}]" if t.key else ""
+            width     = max(len(idx_str), len(t.text), len(label_str))
+            cols.append((idx_str, t.text, label_str, width, t.key))
+
+        # wrap into groups that fit max_width
+        groups, current, current_width = [], [], 0
+        for c in cols:
+            w = c[3] + 2
+            if current and current_width + w > max_width:
+                groups.append(current)
+                current, current_width = [], 0
+            current.append(c)
+            current_width += w
+        if current:
+            groups.append(current)
+
+        lines = []
+        for g in groups:
+            idx_parts, txt_parts, lbl_parts = [], [], []
+            any_label = False
+            for idx_str, text, label_str, width, key in g:
+                idx_parts.append(f"{DIM}{idx_str.ljust(width)}{R}")
+                col = _key_color(key) if key else YELLOW
+                txt_parts.append(f"{col}{BOLD}{text.ljust(width)}{R}")
+                if label_str:
+                    any_label = True
+                    lbl_parts.append(f"{col}{label_str.ljust(width)}{R}")
+                else:
+                    lbl_parts.append(" " * width)
+            lines.append("  ".join(idx_parts))
+            lines.append("  ".join(txt_parts))
+            if any_label:
+                lines.append("  ".join(lbl_parts))
+            lines.append("")  # blank line between wrapped groups
+        if lines and lines[-1] == "":
+            lines.pop()
+        return lines
+
+    def has_required_keys(self) -> bool:
+        keys = {t.key for t in self.tokens if t.key}
+        return "ep" in keys or "se" in keys
+
+    def summary_line(self) -> str:
+        """Compact one-line 'key=value' summary for context headers in later steps."""
+        parts = []
+        for t in self.tokens:
+            if t.key:
+                col = _key_color(t.key)
+                parts.append(f"{DIM}{t.key}{R}={col}{t.text}{R}")
+        return "  ".join(parts) if parts else f"{DIM}(nothing labelled){R}"
+
+    def key_order_assigned(self) -> list[str]:
+        """Keys in the order the user assigned them — used to build the recipe."""
+        seen, order = set(), []
+        for t in self.tokens:
+            if t.key and t.key not in seen:
+                seen.add(t.key)
+                order.append(t.key)
+        return order
+
+    def key_widths(self) -> dict[str, int]:
+        """
+        How many source tokens each assigned key consumed in the sample.
+        Used so a free-text key directly followed by ANOTHER free-text key
+        (e.g. a custom 'group' field immediately before 'title') gets a
+        fixed width — only the LAST free key in a back-to-back run can
+        safely stretch to fill a variable-length gap.
+        """
+        return {t.key: t.width for t in self.tokens if t.key}
+
+
+def _load_token_patterns() -> dict:
+    if TOKEN_PATTERNS_FILE.exists():
+        try:
+            return json.loads(TOKEN_PATTERNS_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_token_pattern(name: str, data: dict):
+    TOKEN_PATTERNS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    saved = _load_token_patterns()
+    saved[name] = data
+    TOKEN_PATTERNS_FILE.write_text(json.dumps(saved, indent=2))
+    success(f"Saved as \"{name}\"")
+
+
+def _pick_token_pattern() -> dict | None:
+    saved = _load_token_patterns()
+    if not saved:
+        warn("No saved patterns yet.")
+        input("  Press Enter to continue...")
+        return None
+    names = list(saved.keys())
+    render(title="Load a saved pattern")
+    for i, name in enumerate(names, 1):
+        p = saved[name]
+        print(f"  {CYAN}{i}{R}  {BOLD}{name}{R}  {DIM}sep=\"{p.get('separator','?')}\"  → {p.get('output_fmt','?')}{R}")
+    blank()
+    while True:
+        raw = input(f"  {BOLD}Number{R} (b=back): ").strip()
+        _check_back(raw)
+        if raw.isdigit() and 1 <= int(raw) <= len(names):
+            return saved[names[int(raw) - 1]]
+        err(f"Enter 1–{len(names)} or 'b'.")
+
+
+def extract_with_recipe(stem: str, separator: str, key_order: list[str],
+                         key_widths: dict[str, int] = None) -> dict:
+    """
+    Apply a saved separator + key_order recipe to a new filename stem.
+
+    key_order is the list of keys in the order they were assigned, e.g.
+    ["show", "se", "group", "title", "quality"] — "group" here is a custom
+    field name the user chose, treated exactly like "title": free text,
+    found by the GAP between fixed anchors rather than a fixed position.
+
+    key_widths (token-count per key from the sample) is used only when two
+    free-text keys sit back-to-back with no anchor between them — the
+    earlier one is locked to its sample width so the later one can still
+    absorb a variable-length remainder (e.g. episode titles of differing
+    word counts).
+    """
+    key_widths = key_widths or {}
+    tokens = stem.split(separator)
+    n = len(tokens)
+
+    # Pass 1 — locate every fixed-pattern anchor (se/season/ep/quality) by
+    # regex, walking forward through key_order so duplicates can't collide.
+    anchor_positions: dict[str, int] = {}
+    search_cursor = 0
+    for key in key_order:
+        if key in FIXED_ANCHOR_KEYS:
+            pat = ANCHOR_PATTERNS[key]
+            for i in range(search_cursor, n):
+                if pat.match(tokens[i]):
+                    anchor_positions[key] = i
+                    search_cursor = i + 1
+                    break
+
+    # Pass 2 — walk key_order left to right with a cursor. Fixed anchors
+    # consume exactly one token at their found position. "show" and any
+    # free-text key (title, or a custom name) consume from the cursor up
+    # to either: the next fixed anchor's position, or — if back-to-back
+    # with another free key — their own recorded sample width.
+    result: dict = {}
+    cursor = 0
+    for i, key in enumerate(key_order):
+        if key == "skip":
+            # still need to advance the cursor correctly for skip spans;
+            # treat exactly like a free key with no special storage.
+            end = n
+            for later in key_order[i + 1:]:
+                if later in anchor_positions:
+                    end = anchor_positions[later]
+                    break
+            if key in key_widths and key_order[i + 1:i + 2] and key_order[i + 1] not in anchor_positions and key_order[i+1] != "show":
+                end = min(cursor + key_widths[key], end)
+            cursor = max(end, cursor)
+            continue
+
+        if key == "show":
+            nxt = key_order[i + 1] if i + 1 < len(key_order) else None
+            end = anchor_positions.get(nxt, n) if nxt else n
+            if end > cursor:
+                result["show"] = " ".join(tokens[cursor:end])
+            cursor = end
+            continue
+
+        if key in anchor_positions:
+            idx = anchor_positions[key]
+            if key == "se":
+                m = re.match(r'[Ss](\d{1,2})[Ee](\d{1,3})', tokens[idx])
+                if m:
+                    result["season"] = m.group(1)
+                    result["ep"]     = m.group(2)
+            else:
+                result[key] = tokens[idx]
+            cursor = idx + 1
+            continue
+
+        # Free-text key (built-in "title" or any custom name).
+        nxt = key_order[i + 1] if i + 1 < len(key_order) else None
+        next_is_free = nxt is not None and nxt not in anchor_positions and nxt != "show"
+        if next_is_free and key in key_widths:
+            # locked width so the key AFTER this one can absorb the
+            # variable remainder
+            end = min(cursor + key_widths[key], n)
+        else:
+            end = n
+            for later in key_order[i + 1:]:
+                if later in anchor_positions:
+                    end = anchor_positions[later]
+                    break
+        if end > cursor:
+            result[key] = " ".join(tokens[cursor:end])
+        cursor = end
+
+    return result
+
+
+def _preview_token_lines(stem: str, separator: str, key_order: list[str],
+                          fmt: str, season: int, files: list[Path], n: int = 3,
+                          key_widths: dict[str, int] = None) -> list[str]:
+    lines = []
+    for f in files[:n]:
+        groups = extract_with_recipe(f.stem, separator, key_order, key_widths)
+        if not groups:
+            continue
+        out = _apply_output_fmt(fmt, groups, season) + f.suffix.lower()
+        short = f.name if len(f.name) <= 42 else f.name[:39] + "…"
+        lines.append(f"{DIM}{short}{R}")
+        lines.append(f"  {GREEN}→ {out}{R}")
+    return lines
+
+
+# ── Step machine ───────────────────────────────────────────────────────────────
+
+def _splitter_step_sample(files: list[Path]) -> str:
+    render(
+        title="Step 1/5 — Pick a file to learn from",
+        sub="We'll split this filename apart, then label each piece so we can\n"
+            "  rebuild a clean new name for every file using the same labels.",
+    )
+    if files:
+        print(f"  {BOLD}Detected:{R}  {files[0].name}")
+        blank()
+    sample = ask("Use this filename (or paste a different one)",
+                 default=files[0].name if files else "", back=False)
+    return sample.strip("'\"") or (files[0].name if files else "")
+
+
+def _splitter_step_separator(sample: str) -> SplitState:
+    stem = Path(sample).stem
+    while True:
+        render(
+            title="Step 2/5 — Pick a separator",
+            context_lines=[f"File: {DIM}{sample}{R}"],
+            sub="What character splits the fields apart in this filename?",
+        )
+        print(f"  {DIM}{stem}{R}")
+        blank()
+        print(f"  {CYAN}1{R} dot \".\"     {CYAN}2{R} space \" \"     {CYAN}3{R} dash \"-\"     {CYAN}4{R} underscore \"_\"")
+        print(f"  {CYAN}5{R} type a custom separator")
+        blank()
+        raw = input(f"  Choice: ").strip().lower()
+        _check_back(raw)
+
+        sep_map = {"1": ".", "2": " ", "3": "-", "4": "_"}
+        if raw in sep_map:
+            sep = sep_map[raw]
+        elif raw == "5":
+            sep = ask("Separator", back=False)
+            if not sep:
+                continue
+        else:
+            err("Enter 1–5.")
+            input("  Press Enter to continue...")
+            continue
+
+        state = SplitState(stem)
+        n = state.split_all(sep)
+        if n == 0:
+            warn(f"That separator doesn't appear in the filename.")
+            input("  Press Enter to continue...")
+            continue
+        return state
+
+
+def _splitter_step_assign(sample: str, state: SplitState) -> None:
+    while True:
+        render(
+            title="Step 3/5 — Label each piece",
+            context_lines=[f"File: {DIM}{sample}{R}"],
+            sub="Type a label, then the index (or range) it applies to.",
+        )
+
+        for line in state.column_rows():
+            print(f"  {line}")
+        blank()
+
+        print(f"  {BOLD}Labels:{R}")
+        for i, key in enumerate(TOKEN_KEY_ORDER, 1):
+            print(f"   {CYAN}{i}{R} {MAGENTA}{key:<8}{R} {TOKEN_KEYS[key]}")
+        blank()
+        used_custom = sorted(k for k in state.key_order_assigned() if k not in TOKEN_KEYS)
+        if used_custom:
+            print(f"  {BOLD}Custom fields already in use:{R} " +
+                  "  ".join(f"{_key_color(k)}{k}{R}" for k in used_custom))
+            blank()
+        print(f"  {DIM}Examples: \"show 0\"  ·  \"se 2\"  ·  \"title 3-6\"{R}")
+        print(f"  {DIM}\"custom group 2\"  → label index 2 as a new field called 'group'{R}")
+        print(f"  {DIM}'resplit N sep' = split token N further · 'undo' = undo last label{R}")
+        print(f"  {DIM}'done' when every needed piece is labelled · 'b' = go back{R}")
+        blank()
+
+        raw = input(f"  Command: ").strip()
+        low = raw.lower()
+
+        if low in ("b", "back"):
+            raise Back()
+        if low == "done":
+            if not state.has_required_keys():
+                err("Label at least the episode number (key 'ep' or 'se').")
+                input("  Press Enter to continue...")
+                continue
+            return
+        if low == "undo":
+            if state.undo():
+                info("Undone.")
+            else:
+                warn("Nothing to undo.")
+            continue
+        if low.startswith("resplit"):
+            parts = raw.split(maxsplit=2)
+            if len(parts) < 3:
+                err("Usage: resplit <index> <separator>")
+                input("  Press Enter to continue...")
+                continue
+            try:
+                idx = int(parts[1])
+            except ValueError:
+                err("Index must be a number.")
+                input("  Press Enter to continue...")
+                continue
+            if not state.split_token(idx, parts[2]):
+                err(f"Separator '{parts[2]}' not found in that token.")
+                input("  Press Enter to continue...")
+            continue
+
+        # ── Custom field syntax: "custom <name> <index>" or "custom <name> <start>-<end>"
+        if low.startswith("custom "):
+            cm = re.match(r'^custom\s+(\w+)\s+(\d+)(?:-(\d+))?$', raw, re.IGNORECASE)
+            if not cm:
+                err("Format: custom <name> <index>  or  custom <name> <start>-<end>")
+                input("  Press Enter to continue...")
+                continue
+            cname, start_s, end_s = cm.groups()
+            cname = cname.lower()
+            if cname in TOKEN_KEYS:
+                err(f"'{cname}' is a reserved label name — pick something else.")
+                input("  Press Enter to continue...")
+                continue
+            start = int(start_s)
+            end   = int(end_s) if end_s else start
+            if start >= len(state.tokens) or end >= len(state.tokens) or start > end:
+                err(f"Index out of range — valid range is 0–{len(state.tokens)-1}.")
+                input("  Press Enter to continue...")
+                continue
+            joiner = " " if state.separator in (".", "_") else state.separator
+            state.assign(start, end, cname, joiner=joiner)
+            continue
+
+        m = re.match(r'^(\w+)\s+(\d+)(?:-(\d+))?$', raw)
+        if not m:
+            err("Format: <label> <index> or <label> <start>-<end>")
+            input("  Press Enter to continue...")
+            continue
+
+        key_input, start_s, end_s = m.groups()
+        key_input = key_input.lower()
+
+        # resolve key by number or name (built-ins only here — customs use 'custom name idx')
+        key = None
+        if key_input.isdigit():
+            ki = int(key_input) - 1
+            if 0 <= ki < len(TOKEN_KEY_ORDER):
+                key = TOKEN_KEY_ORDER[ki]
+                if key == "custom":
+                    err("To add a custom field, type: custom <name> <index>")
+                    input("  Press Enter to continue...")
+                    continue
+        elif key_input in TOKEN_KEYS and key_input != "custom":
+            key = key_input
+        elif key_input in state.key_order_assigned():
+            # re-using an already-defined custom name without the 'custom' prefix
+            key = key_input
+
+        if key is None:
+            err(f"Unknown label '{key_input}'. For a new custom field, type: custom {key_input} <index>")
+            input("  Press Enter to continue...")
+            continue
+
+        start = int(start_s)
+        end   = int(end_s) if end_s else start
+
+        if start >= len(state.tokens) or end >= len(state.tokens) or start > end:
+            err(f"Index out of range — valid range is 0–{len(state.tokens)-1}.")
+            input("  Press Enter to continue...")
+            continue
+
+        joiner = " " if state.separator in (".", "_") else state.separator
+        state.assign(start, end, key, joiner=joiner)
+
+
+def _splitter_step_test(files: list[Path], sample: str, state: SplitState) -> list[str]:
+    """Step 4: confirm the labelling reproduces correctly across the batch."""
+    key_order  = state.key_order_assigned()
+    key_widths = state.key_widths()
+    while True:
+        render(
+            title="Step 4/5 — Check it against your files",
+            context_lines=[f"File: {DIM}{sample}{R}", f"Labels: {state.summary_line()}"],
+        )
+        print(f"  {BOLD}Re-applying your labels to each file:{R}")
+        any_fail = False
+        for f in files[:5]:
+            groups = extract_with_recipe(f.stem, state.separator, key_order, key_widths)
+            if groups.get("ep") or groups.get("season"):
+                shown = "  ".join(f"{DIM}{k}{R}={CYAN}{v}{R}" for k, v in groups.items())
+                print(f"  {GREEN}✓{R} {DIM}{f.name}{R}")
+                print(f"      {shown}")
+            else:
+                print(f"  {RED}✗{R} no episode number found: {DIM}{f.name}{R}")
+                any_fail = True
+        if any_fail:
+            warn("Some files didn't resolve — you may need to relabel a piece.")
+
+        blank()
+        print(f"  {CYAN}1{R} Looks good, continue   {CYAN}2{R} Go back and relabel   {CYAN}b{R} Back")
+        raw = input(f"  Choice: ").strip().lower()
+        _check_back(raw)
+        if raw == "1":
+            return key_order
+        if raw == "2":
+            raise Back()
+
+
+def _splitter_step_output(files: list[Path], sample: str, state: SplitState,
+                           key_order: list[str], season: int) -> str:
+    key_widths = state.key_widths()
+    captured = set(extract_with_recipe(Path(sample).stem, state.separator, key_order, key_widths).keys())
+    fmt_override = None
+    while True:
+        render(
+            title="Step 5/5 — Rebuild the filename",
+            context_lines=[f"Labels: {state.summary_line()}"],
+            sub="Choose how the labelled pieces get put back together into the new name.",
+        )
+        fmt = _build_output_fmt(captured, default_suggestion=fmt_override)
+        preview = _preview_token_lines(sample, state.separator, key_order, fmt, season, files,
+                                        n=3, key_widths=key_widths)
+        if preview:
+            blank()
+            print(f"  {BOLD}Preview:{R}")
+            for line in preview:
+                print(f"  {line}")
+        else:
+            warn("No files matched — go back and check your labels.")
+
+        blank()
+        print(f"  {CYAN}1{R} Use this   {CYAN}2{R} Try a different format   {CYAN}b{R} Back")
+        raw = input(f"  Choice: ").strip().lower()
+        _check_back(raw)
+        if raw == "1":
+            return fmt
+        if raw == "2":
+            fmt_override = fmt
+
+
+def flow_token_splitter(files: list[Path], show: str, season: int, folder: Path):
+    render(title="Mode 7 — Split & Label", sub=(
+        "For filenames where every field is jammed together with the same\n"
+        "  separator (dots, dashes, etc.) — split it apart, then label each piece."
+    ))
+
+    print(f"  {CYAN}1{R} Build new (step-by-step)   {CYAN}2{R} Load a saved pattern")
+    blank()
+
+    saved_recipe = None
+    while True:
+        start = input(f"  {BOLD}Choice{R}: ").strip()
+        if start == "2":
+            try:
+                saved_recipe = _pick_token_pattern()
+            except Back:
+                continue
+            if saved_recipe:
+                break
+        if start in ("1", "2"):
+            break
+        err("Enter 1 or 2.")
+
+    key_widths: dict[str, int] = {}
+
+    if saved_recipe:
+        separator  = saved_recipe["separator"]
+        key_order  = saved_recipe["key_order"]
+        output_fmt = saved_recipe["output_fmt"]
+        key_widths = saved_recipe.get("key_widths", {})
+        render(title="Loaded pattern",
+               context_lines=[f"Separator: {DIM}\"{separator}\"{R}", f"Output: {DIM}{output_fmt}{R}"])
+        for f in files[:5]:
+            groups = extract_with_recipe(f.stem, separator, key_order, key_widths)
+            status = "✓" if (groups.get("ep") or groups.get("season")) else "✗"
+            col = GREEN if status == "✓" else RED
+            print(f"  {col}{status}{R} {DIM}{f.name}{R}")
+        input("  Press Enter to continue...")
+    else:
+        sample = ""
+        state  = None
+        key_order = []
+        output_fmt = ""
+        step = 1
+        while step <= 5:
+            try:
+                if step == 1:
+                    sample = _splitter_step_sample(files)
+                    step = 2
+                elif step == 2:
+                    state = _splitter_step_separator(sample)
+                    step = 3
+                elif step == 3:
+                    _splitter_step_assign(sample, state)
+                    step = 4
+                elif step == 4:
+                    key_order = _splitter_step_test(files, sample, state)
+                    step = 5
+                elif step == 5:
+                    output_fmt = _splitter_step_output(files, sample, state, key_order, season)
+                    step = 6
+            except Back:
+                step = max(1, step - 1)
+
+        key_widths = state.key_widths()
+
+        render(title="Save for next time?",
+               context_lines=[f"Labels: {state.summary_line()}"])
+        if ask_yn("Save this pattern?", default_yes=True):
+            pname = ask("Name", default=show or "my-pattern")
+            _save_token_pattern(pname, {
+                "separator":  state.separator,
+                "key_order":  key_order,
+                "output_fmt": output_fmt,
+                "key_widths": key_widths,
+            })
+        separator = state.separator
+
+    settings = [
+        {"key": "show",   "label": "Show name (overrides detected)", "value": show, "kind": "str"},
+        {"key": "season", "label": "Season number (fallback)",       "value": season, "kind": "int"},
+        {"key": "output", "label": "Output format",                  "value": output_fmt, "kind": "str"},
+    ]
+    settings = review_settings(settings, title="Final Settings")
+    final_show, final_season, final_output_fmt = (
+        get(settings, "show"), get(settings, "season"), get(settings, "output")
+    )
+
+    def build(f, i):
+        groups = extract_with_recipe(f.stem, separator, key_order, key_widths)
+        if not (groups.get("ep") or groups.get("season")):
+            return None
+        if final_show:
+            groups["show"] = final_show
+        return _apply_output_fmt(final_output_fmt, groups, final_season) + f.suffix.lower()
+
+    return build
+
+
 # ─── Utilities ────────────────────────────────────────────────────────────────
 
 def util_preview(folder: Path):
@@ -1300,6 +2077,7 @@ def util_rename_show(folder: Path):
 FLOW_BUILDERS = {
     "1": flow_fansub, "2": flow_one_pace, "3": flow_simple,
     "4": flow_sxxexx, "5": flow_custom_regex, "6": flow_regex_builder,
+    "7": flow_token_splitter,
 }
 
 MODE_LABELS = {
@@ -1309,6 +2087,7 @@ MODE_LABELS = {
     "4": ("Normalize S##E##",       "old.show.S01E04.1080p.mkv"),
     "5": ("Raw Regex",              "type your own pattern"),
     "6": ("Build From Sample",      "guided, works on any format"),
+    "7": ("Split & Label",          "Blue.Box.S01E07.Title.1080p...-GROUP"),
 }
 
 
@@ -1320,9 +2099,9 @@ def main_menu():
         print(f"   {CYAN}{k}{R} {label:<24}{DIM}{example}{R}")
     blank()
     print(f"  {BOLD}Utilities:{R}")
-    print(f"   {CYAN}7{R} Preview files in a folder")
-    print(f"   {CYAN}8{R} Split into Season XX/ subfolders")
-    print(f"   {CYAN}9{R} Rename show name across files")
+    print(f"   {CYAN}8{R} Preview files in a folder")
+    print(f"   {CYAN}9{R} Split into Season XX/ subfolders")
+    print(f"   {CYAN}10{R} Rename show name across files")
     print(f"   {CYAN}q{R} Quit")
     blank()
     return input(f"  {BOLD}Choice{R}: ").strip().lower()
@@ -1350,26 +2129,27 @@ def main():
             print(f"\n  {DIM}Bye!{R}\n")
             break
 
-        if choice == "7":
+        if choice == "8":
             util_preview(pick_folder())
             input("\n  Press Enter to return to menu...")
             continue
-        if choice == "8":
+        if choice == "9":
             util_split(pick_folder())
             input("\n  Press Enter to return to menu...")
             continue
-        if choice == "9":
+        if choice == "10":
             util_rename_show(pick_folder())
             input("\n  Press Enter to return to menu...")
             continue
 
         if choice not in FLOW_BUILDERS:
-            err("Please enter 1–9 or q.")
+            err("Please enter 1–10 or q.")
             input("  Press Enter to continue...")
             continue
 
         label, example = MODE_LABELS[choice]
         render(title=f"Mode: {label}", context_lines=[f"Matches: {DIM}{example}{R}"])
+
 
         folder = pick_folder()
         files  = list_media(folder)
@@ -1410,6 +2190,8 @@ def main():
 
             if action == "1":
                 files = list_media(folder)
+                if not _confirm_show_name(files, folder, build_fn):
+                    continue
                 render(title="Renaming…")
                 run_rename(files, folder, dry_run=False, build_fn=build_fn)
                 input("\n  Press Enter to continue...")
