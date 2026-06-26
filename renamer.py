@@ -188,7 +188,7 @@ def _resolve_path(raw: str) -> Path | None:
     return None
 
 
-def _browse_subfolder(base: Path) -> Path | None:
+def _browse_subfolder(base: Path, title: str = "Choose folder") -> Path | None:
     """Drill into subfolders. Numbers navigate; partial text searches all subdirs."""
     while True:
         try:
@@ -202,7 +202,7 @@ def _browse_subfolder(base: Path) -> Path | None:
         display = all_subdirs[:15]
         overflow = len(all_subdirs) - 15
 
-        render(title="Choose folder", context_lines=[f"📁 {DIM}{base}{R}"])
+        render(title=title, context_lines=[f"📁 {DIM}{base}{R}"])
 
         if display:
             cols = []
@@ -264,7 +264,7 @@ def _browse_subfolder(base: Path) -> Path | None:
             base = matches[0]
             continue
 
-        render(title="Choose folder",
+        render(title=title,
                context_lines=[f"📁 {DIM}{base}{R}", f"🔎 matches for \"{raw}\""])
         for i, d in enumerate(matches, 1):
             print(f"  {CYAN}{i}{R}  {d.name}")
@@ -274,7 +274,7 @@ def _browse_subfolder(base: Path) -> Path | None:
             base = matches[int(pick) - 1]
 
 
-def pick_folder() -> Path:
+def pick_folder(title: str = "Choose folder", sub: str = "") -> Path:
     locations = _find_all_locations()
     gvfs_labels = {"SMB", "FTP", "MTP", "SFTP", "DAV"}
     local_locs = [(l, p) for l, p in locations if not any(t in l for t in gvfs_labels)]
@@ -283,7 +283,7 @@ def pick_folder() -> Path:
     n_local    = len(local_locs)
 
     while True:
-        render(title="Choose folder")
+        render(title=title, sub=sub)
 
         if local_locs:
             print(f"  {BOLD}Local:{R}")
@@ -306,7 +306,7 @@ def pick_folder() -> Path:
         if raw.isdigit():
             idx = int(raw) - 1
             if 0 <= idx < len(all_locs):
-                result = _browse_subfolder(all_locs[idx][1])
+                result = _browse_subfolder(all_locs[idx][1], title=title)
                 if result:
                     return result
                 continue
@@ -381,8 +381,9 @@ def parse_one_pace(filename: str) -> dict:
     parts = cleaned.split()
     ep_num, arc_parts = None, []
     for part in parts:
-        if re.match(r'^\d+$', part):
-            ep_num = int(part)
+        m = re.match(r'^(\d+)(?:[vV]\d+)?$', part)
+        if m:
+            ep_num = int(m.group(1))
         elif ep_num is None:
             arc_parts.append(part)
     return {"ep": ep_num, "arc": " ".join(arc_parts),
@@ -725,7 +726,9 @@ PATTERNS_FILE = Path.home() / ".config" / "rename_media" / "patterns.json"
 CAPTURE_BLOCKS = {
     "show":    {"label": "Show name",        "regex": r"(?P<show>.+?)",
                 "example": ("Horimiya - Episode 01 - Title 1080p", "Horimiya")},
-    "ep":      {"label": "Episode number",   "regex": r"(?P<ep>\d+)",
+    "se":      {"label": "Season+Episode combined", "regex": r"[Ss](?P<season>\d{1,2})[Ee](?P<ep>\d{1,3})(?:[vV]\d+)?",
+                "example": ("Show.S01E07.Title.1080p", "season=01, ep=07")},
+    "ep":      {"label": "Episode number",   "regex": r"(?P<ep>\d+)(?:[vV]\d+)?",
                 "example": ("Horimiya - Episode 01 - Title 1080p", "01")},
     "season":  {"label": "Season number",    "regex": r"(?P<season>\d{1,2})",
                 "example": ("Show S02E05 Title", "02")},
@@ -1025,7 +1028,7 @@ def _builder_step_blocks(files: list[Path], state: BuildState) -> None:
         print(f"  {BOLD}Parts that capture a value:{R}")
         for i, k in enumerate(cap_keys, 1):
             b = CAPTURE_BLOCKS[k]
-            print(f"   {CYAN}{i:>2}{R} {MAGENTA}{k:<8}{R} {b['label']:<22}{DIM}e.g. \"{b['example'][1]}\"{R}")
+            print(f"   {CYAN}{i:>2}{R} {MAGENTA}{k:<8}{R} {b['label']:<24}{DIM}e.g. \"{b['example'][1]}\"{R}")
         blank()
         print(f"  {BOLD}Connecting parts (no value kept):{R}")
         for i, k in enumerate(sep_keys, 1):
@@ -1063,8 +1066,8 @@ def _builder_step_blocks(files: list[Path], state: BuildState) -> None:
                 err("Add at least one part first.")
                 input("  Press Enter to continue...")
                 continue
-            if not any(s["key"] == "ep" for s in state.sequence):
-                err("You need an 'Episode number' part — it's how files get numbered.")
+            if not any(s["key"] in ("ep", "se") for s in state.sequence):
+                err("You need an 'Episode number' or 'Season+Episode' part — it's how files get numbered.")
                 input("  Press Enter to continue...")
                 continue
             return
@@ -1315,9 +1318,9 @@ def _key_color(key: str) -> str:
     return CUSTOM_KEY_PALETTE[idx]
 
 ANCHOR_PATTERNS = {
-    "se":      re.compile(r"^[Ss]\d{1,2}[Ee]\d{1,3}$"),
-    "season":  re.compile(r"^[Ss]\d{1,2}$"),
-    "ep":      re.compile(r"^\d{1,4}$"),
+    "se":      re.compile(r"^[Ss]\d{1,2}[Ee]\d{1,3}(?:[vV]\d+)?$"),
+    "season":  re.compile(r"^[Ss]\d{1,2}(?:[vV]\d+)?$"),
+    "ep":      re.compile(r"^\d{1,4}(?:[vV]\d+)?$"),
     "quality": re.compile(r"^\d{3,4}p$", re.IGNORECASE),
 }
 
@@ -1341,6 +1344,7 @@ class SplitState:
         self.output_fmt: str = ""
         self.separator: str = ""
         self._history: list[list[Token]] = []   # undo stack of token snapshots
+        self.resplits: list[dict] = []           # recorded resplit operations, in order
 
     def _snapshot(self) -> None:
         self._history.append([Token(t.text, t.key, t.width) for t in self.tokens])
@@ -1349,6 +1353,11 @@ class SplitState:
         if not self._history:
             return False
         self.tokens = self._history.pop()
+        # also roll back the most recent resplit record if one was made
+        # at the same point — best-effort, matches typical usage where
+        # undo immediately follows the action it's undoing.
+        if self.resplits:
+            self.resplits.pop()
         return True
 
     def split_all(self, sep: str) -> int:
@@ -1371,6 +1380,17 @@ class SplitState:
         self._snapshot()
         pieces = [Token(p) for p in tok.text.split(sep)]
         self.tokens[idx:idx+1] = pieces
+
+        # Record this resplit so it can be replayed on other files in the
+        # batch. We scope it to "the last anchor key already assigned
+        # at this point" so replay only touches the same relative region
+        # of the filename — e.g. resplitting a release-tag token after
+        # 'quality' won't also split dashes inside the show name.
+        last_anchor_key = None
+        for t in self.tokens[:idx]:
+            if t.key in FIXED_ANCHOR_KEYS:
+                last_anchor_key = t.key
+        self.resplits.append({"after_key": last_anchor_key, "sep": sep})
         return True
 
     def assign(self, start: int, end: int, key: str, joiner: str = " ") -> None:
@@ -1516,8 +1536,52 @@ def _pick_token_pattern() -> dict | None:
         err(f"Enter 1–{len(names)} or 'b'.")
 
 
+def _apply_resplits(tokens: list[str], resplits: list[dict], key_order: list[str]) -> list[str]:
+    """
+    Replay recorded resplit operations against a fresh token list (from a
+    different file in the batch). Each resplit is scoped to only the
+    tokens AFTER the anchor key that was already assigned at the moment
+    the resplit happened during interactive labelling — so a resplit done
+    on a release-tag token near the end of the filename never reaches
+    back and breaks apart something earlier, like a show name containing
+    the same separator character.
+    """
+    if not resplits:
+        return tokens
+
+    def find_anchors(toks: list[str]) -> dict[str, int]:
+        positions: dict[str, int] = {}
+        cursor = 0
+        for key in key_order:
+            if key in FIXED_ANCHOR_KEYS:
+                pat = ANCHOR_PATTERNS[key]
+                for i in range(cursor, len(toks)):
+                    if pat.match(toks[i]):
+                        positions[key] = i
+                        cursor = i + 1
+                        break
+        return positions
+
+    for r in resplits:
+        after_key = r["after_key"]
+        rsep      = r["sep"]
+        anchors   = find_anchors(tokens)
+        start_idx = (anchors[after_key] + 1) if after_key in anchors else 0
+
+        new_tokens = tokens[:start_idx]
+        for t in tokens[start_idx:]:
+            if rsep in t:
+                new_tokens.extend(t.split(rsep))
+            else:
+                new_tokens.append(t)
+        tokens = new_tokens
+
+    return tokens
+
+
 def extract_with_recipe(stem: str, separator: str, key_order: list[str],
-                         key_widths: dict[str, int] = None) -> dict:
+                         key_widths: dict[str, int] = None,
+                         resplits: list[dict] = None) -> dict:
     """
     Apply a saved separator + key_order recipe to a new filename stem.
 
@@ -1531,9 +1595,15 @@ def extract_with_recipe(stem: str, separator: str, key_order: list[str],
     earlier one is locked to its sample width so the later one can still
     absorb a variable-length remainder (e.g. episode titles of differing
     word counts).
+
+    resplits replays any additional 'resplit' operations performed during
+    interactive labelling — e.g. splitting a release-tag token further on
+    a different separator — scoped to only the region after the anchor
+    that was already assigned at that point.
     """
     key_widths = key_widths or {}
     tokens = stem.split(separator)
+    tokens = _apply_resplits(tokens, resplits or [], key_order)
     n = len(tokens)
 
     # Pass 1 — locate every fixed-pattern anchor (se/season/ep/quality) by
@@ -1612,10 +1682,11 @@ def extract_with_recipe(stem: str, separator: str, key_order: list[str],
 
 def _preview_token_lines(stem: str, separator: str, key_order: list[str],
                           fmt: str, season: int, files: list[Path], n: int = 3,
-                          key_widths: dict[str, int] = None) -> list[str]:
+                          key_widths: dict[str, int] = None,
+                          resplits: list[dict] = None) -> list[str]:
     lines = []
     for f in files[:n]:
-        groups = extract_with_recipe(f.stem, separator, key_order, key_widths)
+        groups = extract_with_recipe(f.stem, separator, key_order, key_widths, resplits)
         if not groups:
             continue
         out = _apply_output_fmt(fmt, groups, season) + f.suffix.lower()
@@ -1808,6 +1879,7 @@ def _splitter_step_test(files: list[Path], sample: str, state: SplitState) -> li
     """Step 4: confirm the labelling reproduces correctly across the batch."""
     key_order  = state.key_order_assigned()
     key_widths = state.key_widths()
+    resplits   = state.resplits
     while True:
         render(
             title="Step 4/5 — Check it against your files",
@@ -1816,7 +1888,7 @@ def _splitter_step_test(files: list[Path], sample: str, state: SplitState) -> li
         print(f"  {BOLD}Re-applying your labels to each file:{R}")
         any_fail = False
         for f in files[:5]:
-            groups = extract_with_recipe(f.stem, state.separator, key_order, key_widths)
+            groups = extract_with_recipe(f.stem, state.separator, key_order, key_widths, resplits)
             if groups.get("ep") or groups.get("season"):
                 shown = "  ".join(f"{DIM}{k}{R}={CYAN}{v}{R}" for k, v in groups.items())
                 print(f"  {GREEN}✓{R} {DIM}{f.name}{R}")
@@ -1840,7 +1912,9 @@ def _splitter_step_test(files: list[Path], sample: str, state: SplitState) -> li
 def _splitter_step_output(files: list[Path], sample: str, state: SplitState,
                            key_order: list[str], season: int) -> str:
     key_widths = state.key_widths()
-    captured = set(extract_with_recipe(Path(sample).stem, state.separator, key_order, key_widths).keys())
+    resplits   = state.resplits
+    captured = set(extract_with_recipe(Path(sample).stem, state.separator, key_order,
+                                        key_widths, resplits).keys())
     fmt_override = None
     while True:
         render(
@@ -1850,7 +1924,7 @@ def _splitter_step_output(files: list[Path], sample: str, state: SplitState,
         )
         fmt = _build_output_fmt(captured, default_suggestion=fmt_override)
         preview = _preview_token_lines(sample, state.separator, key_order, fmt, season, files,
-                                        n=3, key_widths=key_widths)
+                                        n=3, key_widths=key_widths, resplits=resplits)
         if preview:
             blank()
             print(f"  {BOLD}Preview:{R}")
@@ -1893,16 +1967,18 @@ def flow_token_splitter(files: list[Path], show: str, season: int, folder: Path)
         err("Enter 1 or 2.")
 
     key_widths: dict[str, int] = {}
+    resplits: list[dict] = []
 
     if saved_recipe:
         separator  = saved_recipe["separator"]
         key_order  = saved_recipe["key_order"]
         output_fmt = saved_recipe["output_fmt"]
         key_widths = saved_recipe.get("key_widths", {})
+        resplits   = saved_recipe.get("resplits", [])
         render(title="Loaded pattern",
                context_lines=[f"Separator: {DIM}\"{separator}\"{R}", f"Output: {DIM}{output_fmt}{R}"])
         for f in files[:5]:
-            groups = extract_with_recipe(f.stem, separator, key_order, key_widths)
+            groups = extract_with_recipe(f.stem, separator, key_order, key_widths, resplits)
             status = "✓" if (groups.get("ep") or groups.get("season")) else "✗"
             col = GREEN if status == "✓" else RED
             print(f"  {col}{status}{R} {DIM}{f.name}{R}")
@@ -1934,6 +2010,7 @@ def flow_token_splitter(files: list[Path], show: str, season: int, folder: Path)
                 step = max(1, step - 1)
 
         key_widths = state.key_widths()
+        resplits   = state.resplits
 
         render(title="Save for next time?",
                context_lines=[f"Labels: {state.summary_line()}"])
@@ -1944,6 +2021,7 @@ def flow_token_splitter(files: list[Path], show: str, season: int, folder: Path)
                 "key_order":  key_order,
                 "output_fmt": output_fmt,
                 "key_widths": key_widths,
+                "resplits":   resplits,
             })
         separator = state.separator
 
@@ -1958,7 +2036,7 @@ def flow_token_splitter(files: list[Path], show: str, season: int, folder: Path)
     )
 
     def build(f, i):
-        groups = extract_with_recipe(f.stem, separator, key_order, key_widths)
+        groups = extract_with_recipe(f.stem, separator, key_order, key_widths, resplits)
         if not (groups.get("ep") or groups.get("season")):
             return None
         if final_show:
@@ -2072,6 +2150,330 @@ def util_rename_show(folder: Path):
     info(f"{ok}/{len(pairs)} files renamed.")
 
 
+# ─── Overwrite by Episode Number ──────────────────────────────────────────────
+#
+# Takes two folders: a SOURCE folder of already-correctly-named episodes,
+# and a MATCH folder of episodes (often messily named) that should replace
+# the source files' CONTENT while keeping the source's clean filename.
+# Both folders are scanned for an SxxExx pattern; files pairing up by the
+# same season+episode get the source file's content replaced with the
+# match file's content. The original source file is never deleted outright
+# — it's moved into a .backup_before_overwrite/ subfolder first.
+
+SXXEXX_SEARCH = re.compile(r'[Ss](\d{1,2})[\.\-_ ]?[Ee](\d{1,3})(?:[vV]\d+)?')
+
+def _extract_se_loose(filename: str) -> tuple[int, int] | None:
+    """Find a SxxExx-style season+episode anywhere in the filename,
+    tolerating a dot/dash/space/underscore between S## and E##, and an
+    optional trailing version suffix like v2."""
+    m = SXXEXX_SEARCH.search(filename)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    return None
+
+
+def _build_se_map(files: list[Path]) -> dict[tuple[int, int], list[Path]]:
+    mapping: dict[tuple[int, int], list[Path]] = {}
+    for f in files:
+        se = _extract_se_loose(f.name)
+        if se:
+            mapping.setdefault(se, []).append(f)
+    return mapping
+
+
+def util_overwrite_by_episode(source_folder: Path = None, match_folder: Path = None):
+    render(title="Overwrite by Episode Number",
+           sub="Replace already-named episodes in a Source folder with the\n"
+               "  content of matching episodes from a Match folder, by episode number.")
+
+    if source_folder is None:
+        source_folder = pick_folder(
+            title="① Choose the SOURCE folder",
+            sub="These files already have the names you want to KEEP.\n"
+                "  Only their content will be replaced — filenames stay the same."
+        )
+
+    if match_folder is None:
+        match_folder = pick_folder(
+            title="② Choose the MATCH folder",
+            sub="These files provide the NEW content to copy in.\n"
+                "  They're matched to Source files by season+episode number."
+        )
+
+    source_files = list_media(source_folder)
+    match_files  = list_media(match_folder)
+
+    if not source_files:
+        warn("No media files found in the Source folder.")
+        return
+    if not match_files:
+        warn("No media files found in the Match folder.")
+        return
+
+    render(title="Folders selected",
+           context_lines=[
+               f"① SOURCE  {DIM}(keeps its names){R}",
+               f"   {source_folder}",
+               f"② MATCH   {DIM}(provides new content){R}",
+               f"   {match_folder}",
+           ])
+    info(f"Source: {len(source_files)} file(s) found.")
+    info(f"Match:  {len(match_files)} file(s) found.")
+    blank()
+    if not ask_yn("Continue with these folders?", default_yes=True, back=False):
+        info("Cancelled.")
+        return
+
+    source_map = _build_se_map(source_files)
+    match_map  = _build_se_map(match_files)
+
+    # Flag anything that couldn't be parsed at all
+    unparsed_source = [f for f in source_files if _extract_se_loose(f.name) is None]
+    unparsed_match  = [f for f in match_files if _extract_se_loose(f.name) is None]
+
+    # Build the pairing plan, prompting for disambiguation when a season+
+    # episode has more than one candidate in the match folder.
+    plan: list[tuple[Path, Path]] = []          # (source_file, chosen_match_file)
+    skipped_multi: list[tuple] = []
+    unmatched_source: list[Path] = []
+
+    for se, src_list in sorted(source_map.items()):
+        if len(src_list) > 1:
+            # Multiple source files share the same S/E — flag for visibility,
+            # but still try to pair each one individually below.
+            pass
+        candidates = match_map.get(se)
+        if not candidates:
+            unmatched_source.extend(src_list)
+            continue
+        for src in src_list:
+            if len(candidates) == 1:
+                plan.append((src, candidates[0]))
+            else:
+                skipped_multi.append((se, src, candidates))
+
+    unmatched_match = [f for se, flist in match_map.items()
+                        if se not in source_map for f in flist]
+
+    # ── Show a summary before anything else ───────────────────────────────────
+    blank()
+    info(f"Source folder: {len(source_files)} file(s),  Match folder: {len(match_files)} file(s)")
+    blank()
+
+    if unparsed_source:
+        warn(f"{len(unparsed_source)} Source file(s) had no recognisable S/E number — skipped:")
+        for f in unparsed_source[:5]:
+            print(f"    {DIM}{f.name}{R}")
+        if len(unparsed_source) > 5:
+            print(f"    {DIM}… +{len(unparsed_source)-5} more{R}")
+        blank()
+
+    if unparsed_match:
+        warn(f"{len(unparsed_match)} Match file(s) had no recognisable S/E number — skipped:")
+        for f in unparsed_match[:5]:
+            print(f"    {DIM}{f.name}{R}")
+        if len(unparsed_match) > 5:
+            print(f"    {DIM}… +{len(unparsed_match)-5} more{R}")
+        blank()
+
+    # ── Resolve multi-candidate matches interactively ─────────────────────────
+    for se, src, candidates in skipped_multi:
+        render(title="Multiple matches found",
+               context_lines=[f"Source: {DIM}{src.name}{R}",
+                               f"Episode: S{se[0]:02d}E{se[1]:02d}"])
+        print(f"  {BOLD}Pick which Match file should overwrite this Source file:{R}\n")
+        for i, c in enumerate(candidates, 1):
+            print(f"    {CYAN}{i}{R}  {c.name}")
+        print(f"    {CYAN}0{R}  Skip this episode")
+        blank()
+        while True:
+            raw = input(f"  Choice: ").strip()
+            if raw == "0":
+                break
+            if raw.isdigit() and 1 <= int(raw) <= len(candidates):
+                plan.append((src, candidates[int(raw) - 1]))
+                break
+            err(f"Enter 0–{len(candidates)}.")
+
+    if not plan:
+        warn("Nothing to overwrite — no matching episodes found.")
+        return
+
+    # ── Dry-run preview ────────────────────────────────────────────────────────
+    while True:
+        render(title="Overwrite by Episode Number — Preview",
+               context_lines=[f"① Source: {DIM}{source_folder}{R}",
+                               f"② Match:  {DIM}{match_folder}{R}"])
+        print(f"  {BOLD}{len(plan)} file(s) will be overwritten:{R}\n")
+        for src, match in plan:
+            se = _extract_se_loose(src.name)
+            print(f"  {DIM}S{se[0]:02d}E{se[1]:02d}{R}  {BOLD}{src.name}{R}")
+            print(f"        {DIM}content replaced from:{R} {match.name}")
+        if unmatched_source:
+            blank()
+            warn(f"{len(unmatched_source)} Source episode(s) have no match — left untouched:")
+            for f in unmatched_source[:5]:
+                print(f"    {DIM}{f.name}{R}")
+            if len(unmatched_source) > 5:
+                print(f"    {DIM}… +{len(unmatched_source)-5} more{R}")
+        if unmatched_match:
+            blank()
+            info(f"{len(unmatched_match)} Match file(s) have no Source episode — ignored.")
+
+        blank()
+        print(f"  {BOLD}Originals are NEVER deleted{R} — they're moved into")
+        print(f"  {DIM}{source_folder / '.backup_before_overwrite'}{R}")
+        blank()
+        print(f"  {CYAN}1{R} Apply for real   {CYAN}2{R} Cancel")
+        action = input(f"  Choice: ").strip()
+
+        if action == "2" or action == "":
+            info("Cancelled — no files changed.")
+            return
+        if action != "1":
+            err("Enter 1 or 2.")
+            continue
+        break
+
+    # ── Final confirmation, same pattern as the rename modes ──────────────────
+    render(title="Final confirmation",
+           context_lines=[f"About to overwrite {BOLD}{len(plan)}{R} file(s) in:",
+                           f"{DIM}{source_folder}{R}"])
+    print(f"  Type the Source folder name to confirm and proceed:")
+    blank()
+    print(f"    {BOLD}{CYAN}{source_folder.name}{R}")
+    blank()
+    typed = input(f"  {BOLD}Confirm{R}: ").strip()
+    if typed != source_folder.name:
+        if typed:
+            err(f"\"{typed}\" doesn't match \"{source_folder.name}\" — cancelled, no files changed.")
+        else:
+            info("Cancelled — no files changed.")
+        input("  Press Enter to continue...")
+        return
+
+    # ── Perform the overwrite ──────────────────────────────────────────────────
+    backup_dir = source_folder / ".backup_before_overwrite"
+    ok = skip = 0
+    render(title="Overwriting…")
+    for src, match in plan:
+        try:
+            backup_dir.mkdir(exist_ok=True)
+            backup_target = backup_dir / src.name
+            if backup_target.exists():
+                # avoid clobbering an earlier backup of the same name
+                stem, suf = src.stem, src.suffix
+                n = 1
+                while (backup_dir / f"{stem} ({n}){suf}").exists():
+                    n += 1
+                backup_target = backup_dir / f"{stem} ({n}){suf}"
+            shutil.move(str(src), str(backup_target))
+            shutil.move(str(match), str(src))
+            success(f"{DIM}{src.name}{R}  {GREEN}← {match.name}{R}")
+            ok += 1
+        except Exception as e:
+            err(f"Failed on {src.name}: {e}")
+            skip += 1
+
+    blank()
+    info(f"{ok}/{len(plan)} file(s) overwritten.  {skip} failed.")
+    info(f"Originals backed up to: {DIM}{backup_dir}{R}")
+
+    if ok > 0 and backup_dir.is_dir():
+        blank()
+        print(f"  {DIM}You can delete the backup now if you've checked the new files,{R}")
+        print(f"  {DIM}or come back to it later from the main menu (option 12).{R}")
+        blank()
+        if ask_yn("Delete the backup folder now?", default_yes=False, back=False):
+            try:
+                shutil.rmtree(backup_dir)
+                success(f"Deleted: {backup_dir}")
+            except Exception as e:
+                err(f"Could not delete backup folder: {e}")
+
+
+def util_cleanup_backups(folder: Path = None):
+    """
+    Find and optionally delete .backup_before_overwrite folders left behind
+    by the Overwrite by Episode Number tool. Scans the given folder and one
+    level of its subfolders, since backups live inside whichever Source
+    folder they were created in.
+    """
+    render(title="Clean Up Backup Folders",
+           sub="Finds .backup_before_overwrite folders left by the\n"
+               "  'Overwrite by Episode Number' tool and lets you delete them.")
+
+    if folder is None:
+        folder = pick_folder(
+            title="Choose where to search",
+            sub="We'll look here and one level into subfolders for backups."
+        )
+
+    found: list[Path] = []
+    candidate = folder / ".backup_before_overwrite"
+    if candidate.is_dir():
+        found.append(candidate)
+    try:
+        for sub in folder.iterdir():
+            if sub.is_dir() and not sub.name.startswith("."):
+                cand2 = sub / ".backup_before_overwrite"
+                if cand2.is_dir():
+                    found.append(cand2)
+    except PermissionError:
+        pass
+
+    if not found:
+        blank()
+        info(f"No backup folders found under: {DIM}{folder}{R}")
+        return
+
+    render(title="Backup folders found", context_lines=[f"Searched: {DIM}{folder}{R}"])
+    for i, bdir in enumerate(found, 1):
+        try:
+            file_count = sum(1 for _ in bdir.iterdir())
+        except PermissionError:
+            file_count = "?"
+        print(f"  {CYAN}{i}{R}  {bdir}  {DIM}({file_count} file(s)){R}")
+
+    blank()
+    print(f"  {CYAN}a{R}  Delete ALL of the above")
+    print(f"  {CYAN}1-{len(found)}{R}  Delete one by number")
+    print(f"  {CYAN}n{R}  Cancel, delete nothing")
+    blank()
+
+    raw = input(f"  Choice: ").strip().lower()
+
+    to_delete: list[Path] = []
+    if raw == "a":
+        to_delete = found
+    elif raw.isdigit() and 1 <= int(raw) <= len(found):
+        to_delete = [found[int(raw) - 1]]
+    else:
+        info("Cancelled — nothing deleted.")
+        return
+
+    blank()
+    print(f"  {BOLD}About to permanently delete:{R}")
+    for bdir in to_delete:
+        print(f"    {DIM}{bdir}{R}")
+    blank()
+    if not ask_yn("Are you sure?", default_yes=False, back=False):
+        info("Cancelled — nothing deleted.")
+        return
+
+    ok = 0
+    for bdir in to_delete:
+        try:
+            shutil.rmtree(bdir)
+            success(f"Deleted: {bdir}")
+            ok += 1
+        except Exception as e:
+            err(f"Failed to delete {bdir}: {e}")
+
+    blank()
+    info(f"{ok}/{len(to_delete)} backup folder(s) deleted.")
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 FLOW_BUILDERS = {
@@ -2102,6 +2504,8 @@ def main_menu():
     print(f"   {CYAN}8{R} Preview files in a folder")
     print(f"   {CYAN}9{R} Split into Season XX/ subfolders")
     print(f"   {CYAN}10{R} Rename show name across files")
+    print(f"   {CYAN}11{R} Overwrite by Episode Number  {DIM}(replace content using a match folder){R}")
+    print(f"   {CYAN}12{R} Clean up backup folders      {DIM}(from option 11){R}")
     print(f"   {CYAN}q{R} Quit")
     blank()
     return input(f"  {BOLD}Choice{R}: ").strip().lower()
@@ -2141,9 +2545,17 @@ def main():
             util_rename_show(pick_folder())
             input("\n  Press Enter to return to menu...")
             continue
+        if choice == "11":
+            util_overwrite_by_episode()
+            input("\n  Press Enter to return to menu...")
+            continue
+        if choice == "12":
+            util_cleanup_backups()
+            input("\n  Press Enter to return to menu...")
+            continue
 
         if choice not in FLOW_BUILDERS:
-            err("Please enter 1–10 or q.")
+            err("Please enter 1–12 or q.")
             input("  Press Enter to continue...")
             continue
 
