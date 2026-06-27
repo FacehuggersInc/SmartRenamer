@@ -11,6 +11,7 @@ from pathlib import Path
 
 from ..core.display import BOLD, Back, CYAN, DIM, GREEN, R, YELLOW, ask, ask_yn, blank, dryline, err, info, render, success, warn
 from ..core.filesystem import _clean_show_folder_name, list_media, pick_folder, safe_rename
+from ..core.registry import UtilEntry
 
 
 SEASON_FOLDER_PATTERNS = [
@@ -515,3 +516,17 @@ def util_define_season_ranges(folder: Path = None):
 
     blank()
     info(f"{ok}/{len(plan)} file(s) organised into {len(ranges)} season folder(s).  {skip} skipped.")
+
+
+UTILITY_ENTRIES = [
+    UtilEntry(
+        "Renumber / Move Season",
+        "Moves a season's episodes, appends them, and closes any gaps.",
+        util_renumber_season,
+    ),
+    UtilEntry(
+        "Split Into Seasons By Range",
+        "Define episode ranges — each becomes its own Season folder.",
+        util_define_season_ranges,
+    ),
+]

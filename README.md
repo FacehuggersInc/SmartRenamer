@@ -1,10 +1,9 @@
-# Media Batch Renamer — package structure
+# Media Batch Renamer
 
-This used to be one ~4,300-line file. It's now split into a package so you
-can find things quickly and add new functionality without touching code
-you don't need to.
-
-## How to run it
+A terminal tool for batch-renaming anime/TV episode files into clean,
+consistent names like `Show Name - S01E01 - Episode Title.mkv`, and for
+keeping a season's folder structure tidy. Runs on Linux, macOS, and
+Windows.
 
 ```bash
 chmod +x run.py
@@ -12,103 +11,57 @@ chmod +x run.py
 ./run.py /path/to/your/show     # optional starting folder
 ```
 
-`run.py` is a thin launcher — it just points Python at the package next to
-it and calls the real entry point. You should never need to edit it.
+## What's included
 
-## Layout
+**Rename modes** (pick the one that matches your filenames):
 
-```
-run.py                          ← launcher, don't touch
-rename_media_package/
-  main.py                       ← the menu loop and dispatch
-  core/
-    display.py                 ← colours, render(), ask()/ask_yn(), Back
-    filesystem.py               ← folder picking, list_media, safe_rename
-    parsers.py                  ← filename parsers for Modes 1-4
-    rename_engine.py            ← the dry-run/apply loop, settings screen,
-                                   final show-name confirmation
-    config.py                    ← where saved patterns live on disk
-    dispatch.py                  ← wires every mode into one table; drives
-                                    a mode end-to-end against a folder
-  modes/
-    simple_modes.py              ← Modes 1-4
-    mode5_regex.py                ← Mode 5
-    mode6_builder.py              ← Mode 6 (Build From Sample)
-    mode7_splitter.py             ← Mode 7 (Split & Label)
-    mode8_trim.py                 ← Mode 8 (Trim Filename)
-  utilities/
-    basic.py                      ← Preview / Split-into-seasons / Rename-show-name
-    overwrite.py                  ← Overwrite by Episode Number + backup cleanup
-    season_tools.py               ← shared season-folder helpers + the two
-                                     season-renumbering utilities
-    setup_show.py                  ← Set Up Show + Season Folders
-    multi_batch.py                 ← Multi-Batch Rename
-```
+1. **Standard Fansub** — `[Group]Show_-_01_(info).mkv` style releases
+2. **One Pace / Group+Range** — releases with arc names and episode ranges
+3. **Simple Numbered** — plain numbered files (`01.mkv`, `Episode 05.mkv`)
+4. **Normalize S##E##** — cleans up filenames that already have a season+episode
+5. **Raw Regex** — type your own regex with named groups
+6. **Build From Sample** — guided builder: pick a sample, identify its parts, rebuild
+7. **Split & Label** — for dot/dash-bombed filenames; split on a separator, label each piece
+8. **Trim Filename** — already-correct names with junk attached; keep a range, drop the rest
 
-## Where to add things
+**Utilities:**
 
-**A new rename mode** → new file in `modes/`, then two lines in
+- **Preview files in a folder** — lists media files, no renaming
+- **Split into Season XX/ subfolders** — sorts files by S01/S02 tag
+- **Rename show name across files** — swaps the show-name prefix on already-renamed files
+- **Multi-Batch Rename** — runs a rename mode across every Season folder in turn
+- **Overwrite by Episode Number** — replaces a Source file's content with a Match file's, by episode
+- **Clean up backup folders** — deletes leftover `.backup_before_overwrite` folders
+- **Renumber / Move Season** — moves a season's episodes, appends them, closes gaps
+- **Split Into Seasons By Range** — turns a flat folder of episodes into Season folders
+- **Set Up Show + Season Folders** — creates season folders and pulls files in from Downloads
+
+## Adding a new tool
+
+**A new rename mode** — add a file in `modes/`, then register it in
 `core/dispatch.py`:
 
 ```python
 from ..modes.my_new_mode import flow_my_thing
-# ...
+
 FLOW_BUILDERS["9"] = flow_my_thing
 MODE_LABELS["9"] = ("My Thing", "example.mkv", "One-line description.")
 ```
 
-**A new utility** → new file in `utilities/`, then in `main.py` add one
-`if choice == "18":` block calling it, plus one line in the menu listing
-in `main_menu()`. That's it — `main.py` doesn't need to know anything
-about how your utility works internally.
-
-**A new helper used by several existing files** (a new parser, a new
-string-cleanup function, a new way to find folders) → add it to whichever
-`core/*.py` file it's closest to in spirit. If it's genuinely new
-territory, add a new file under `core/` and import from it wherever
-needed — nothing else needs to change.
-
-**A fix or tweak to something that already exists** → find it by name;
-every file is named for what's in it, and each one is small enough to
-read in a minute or two.
-
-## How the pieces fit together
-
-- `core/` never imports from `modes/` or `utilities/` — it's the
-  foundation everything else builds on.
-- `modes/` only imports from `core/` (mode 7 also borrows two small
-  helpers from mode 6's output-formatting code).
-- `utilities/` only imports from `core/`, and occasionally from each
-  other (the season-related utilities share `season_tools.py`).
-- `core/dispatch.py` is the one place that knows about every mode — it's
-  what lets both the normal menu and the Multi-Batch tool run any mode
-  against a folder without needing their own copy of that logic.
-- `main.py` sits on top of all of it and only deals with the menu and
-  top-level argument parsing.
-
-If you're ever unsure where to put something: if it touches `Path`,
-folders, or renaming files, it's `core`. If it's a self-contained way of
-deciding what a new filename should be, it's a mode. If it's a one-off
-folder-management operation, it's a utility.
-
-## A couple of things to know about if you're adding global state
-
-Two flags are shared across the whole program by being mutated from
-outside the file that defines them:
-
-- `core.filesystem._CLI_INITIAL_PATH` — the folder passed on the command
-  line, offered once then cleared.
-- `core.display._BATCH_CONTEXT` — set by the Multi-Batch tool so every
-  screen shows which season it's on.
-
-If you ever need to add something similar, **don't** write
-`from core.display import _BATCH_CONTEXT` and then `global _BATCH_CONTEXT`
-in your file — that only rebinds your own file's local copy of the name,
-it won't actually change anything the rest of the program sees. Instead,
-import the module itself and set the attribute on it directly:
+**A new utility** — add a file in `utilities/` ending with a
+`UTILITY_ENTRIES` list:
 
 ```python
-from ..core import display as _display
-# ...
-_display._BATCH_CONTEXT = "whatever you need"
+from ..core.registry import UtilEntry
+
+def util_my_thing(folder):   # name the param 'folder' to get one picked for you
+    ...
+
+UTILITY_ENTRIES = [
+    UtilEntry("My Thing", "One-line description.", util_my_thing),
+]
 ```
+
+That's it — `main.py` never needs editing. It discovers every file in
+`utilities/` on startup, collects each one's `UTILITY_ENTRIES`, and
+assigns menu numbers automatically right after the rename modes.

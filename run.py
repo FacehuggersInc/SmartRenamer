@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-run.py — launcher for the rename_media_package.
+run.py — launcher for the src.
 
 This file exists purely so you can run the tool the same simple way as
 before:
@@ -8,8 +8,8 @@ before:
     ./run.py
     ./run.py /path/to/your/show
 
-It just makes sure Python can find the rename_media_package next to it,
-then hands off to the real entry point in rename_media_package/main.py.
+It just makes sure Python can find the src next to it,
+then hands off to the real entry point in src/main.py.
 You should never need to edit this file.
 """
 import sys

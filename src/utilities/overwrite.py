@@ -9,6 +9,7 @@ from pathlib import Path
 
 from ..core.display import BOLD, CYAN, DIM, GREEN, R, ask_yn, blank, c, err, info, render, success, warn
 from ..core.filesystem import list_media, pick_folder
+from ..core.registry import UtilEntry
 from .season_tools import _confirm_show_name_for_folder
 
 
@@ -307,3 +308,17 @@ def util_cleanup_backups(folder: Path = None):
 
     blank()
     info(f"{ok}/{len(to_delete)} backup folder(s) deleted.")
+
+
+UTILITY_ENTRIES = [
+    UtilEntry(
+        "Overwrite by Episode Number",
+        "Replaces a Source file's content with a Match file's, by S/E number.",
+        util_overwrite_by_episode,
+    ),
+    UtilEntry(
+        "Clean up backup folders",
+        "Finds and deletes .backup_before_overwrite folders left by Overwrite by Episode Number.",
+        util_cleanup_backups,
+    ),
+]

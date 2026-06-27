@@ -4,10 +4,12 @@ across-files utilities.
 """
 
 import re
+import shutil
 from pathlib import Path
 
 from ..core.display import BOLD, CYAN, DIM, GREEN, R, ask, ask_yn, blank, dryline, err, info, render, success, warn
 from ..core.filesystem import list_media, sanitize_filename
+from ..core.registry import UtilEntry
 
 
 def util_preview(folder: Path):
@@ -108,3 +110,22 @@ def util_rename_show(folder: Path):
             err(f"Failed: {e}")
     blank()
     info(f"{ok}/{len(pairs)} files renamed.")
+
+
+UTILITY_ENTRIES = [
+    UtilEntry(
+        "Preview files in a folder",
+        "Just lists the media files found — no renaming.",
+        util_preview,
+    ),
+    UtilEntry(
+        "Split into Season XX/ subfolders",
+        "Scans filenames for S01/S02 tags and sorts files into folders.",
+        util_split,
+    ),
+    UtilEntry(
+        "Rename show name across files",
+        "Swaps the show-name prefix on files already named ...-S01E01.",
+        util_rename_show,
+    ),
+]

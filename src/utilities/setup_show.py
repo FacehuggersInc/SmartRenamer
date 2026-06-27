@@ -11,6 +11,7 @@ from pathlib import Path
 from ..core.config import _config_dir
 from ..core.display import BOLD, Back, CYAN, DIM, GREEN, R, YELLOW, ask, ask_yn, blank, dryline, err, info, render, success, warn
 from ..core.filesystem import list_media, pick_folder
+from ..core.registry import UtilEntry
 from .season_tools import _detect_season_from_foldername
 
 
@@ -347,3 +348,12 @@ def util_setup_show(source: Path = None, downloads: Path = None):
 
     blank()
     success("Done setting up the show's folders.")
+
+
+UTILITY_ENTRIES = [
+    UtilEntry(
+        "Set Up Show + Season Folders",
+        "Create season folders and pull files in from a Downloads folder.",
+        util_setup_show,
+    ),
+]

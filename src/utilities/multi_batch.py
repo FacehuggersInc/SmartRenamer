@@ -9,6 +9,7 @@ from ..core.dispatch import FLOW_BUILDERS, MODE_LABELS, run_rename_mode_on_folde
 from ..core import display as _display
 from ..core.display import BOLD, CYAN, DIM, R, ask_yn, blank, err, info, render, success, warn
 from ..core.filesystem import list_media, pick_folder
+from ..core.registry import UtilEntry
 from .setup_show import _existing_season_folders
 
 
@@ -76,3 +77,12 @@ def util_multi_batch(root: Path = None):
 
     render(title="Multi-Batch Rename — Done")
     success(f"Finished going through {total} season folder(s).")
+
+
+UTILITY_ENTRIES = [
+    UtilEntry(
+        "Multi-Batch Rename",
+        "Run a rename mode across every Season folder, one after another.",
+        util_multi_batch,
+    ),
+]
