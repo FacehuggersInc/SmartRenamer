@@ -628,7 +628,7 @@ def _confirm_show_name(files: list[Path], folder: Path, build_fn) -> bool:
         # in the standard output convention used across all modes
         m = re.match(r'^(.+?)\s+-\s+', preview_name)
         if m:
-            detected_show = m.group(1)
+            detected_show = _clean_show_folder_name(m.group(1))
 
     render(title="Final confirmation",
            context_lines=[f"About to rename {BOLD}{len(files)}{R} file(s) in:",
@@ -1414,6 +1414,234 @@ def flow_regex_builder(files: list[Path], show: str, season: int, folder: Path):
         if final_show:
             gd["show"] = final_show
         return _apply_output_fmt(final_output_fmt, gd, final_season) + f.suffix.lower()
+
+    return build
+
+
+# ─── Trim Filename Tail/Front (Mode 8) ────────────────────────────────────────
+#
+# For filenames that are ALREADY correctly named at the front (or back) but
+# have unwanted junk attached — e.g. "Show - S01E01 - Title.1080p.WEBRip
+# .x264-GROUP.mkv" where everything after "Title" should just go away.
+#
+# Splits the filename on a separator, shows the indexed pieces, and lets
+# the user pick which range to KEEP. The kept range generalizes correctly
+# across the whole batch even when the dropped portion's length varies
+# per file:
+#   - keep starts at 0, ends before the sample's last token  → drop COUNT
+#     from the tail is remembered and replayed (handles a junk tail of
+#     different length per file)
+#   - keep ends at the sample's last token, starts after 0   → drop COUNT
+#     from the front is remembered and replayed
+#   - keep is a literal middle slice (neither edge touches the sample's
+#     boundary) → kept as an exact fixed-width range, since there's no
+#     other sensible way to generalize a true middle slice
+
+def _trim_build_plan(stem: str, sep: str, start: int, end: int, sample_token_count: int) -> str:
+    """
+    Apply a trim recipe (start/end indices recorded against the SAMPLE's
+    token count) to any stem, generalizing correctly when the kept range
+    touches either edge of the sample.
+    """
+    tokens = stem.split(sep)
+    n = len(tokens)
+    sample_n = sample_token_count
+
+    keep_from_front = (start == 0)
+    keep_to_back = (end == sample_n - 1)
+
+    if keep_from_front and keep_to_back:
+        kept = tokens   # keeping everything — a no-op trim
+    elif keep_from_front and not keep_to_back:
+        drop_count = sample_n - 1 - end
+        kept = tokens[: n - drop_count] if n - drop_count > 0 else tokens
+    elif keep_to_back and not keep_from_front:
+        drop_count = start
+        kept = tokens[drop_count:] if drop_count < n else tokens
+    else:
+        kept = tokens[start:end + 1]
+
+    return sep.join(kept)
+
+
+def _trim_step_sample(files: list[Path]) -> str:
+    render(
+        title="Step 1/3 — Pick a file to learn from",
+        sub="We'll split this filename apart so you can pick which part to keep.",
+    )
+    if files:
+        print(f"  {BOLD}Detected:{R}  {files[0].name}")
+        blank()
+    sample = ask("Use this filename (or paste a different one)",
+                 default=files[0].name if files else "", back=False)
+    return sample.strip("'\"") or (files[0].name if files else "")
+
+
+def _trim_step_separator_and_range(sample: str) -> tuple[str, int, int, int]:
+    """Step 2: pick a separator, then pick the keep range. Returns
+    (separator, start, end, sample_token_count)."""
+    stem = Path(sample).stem
+    sep = ""
+    tokens: list[str] = []
+
+    while True:
+        render(
+            title="Step 2/3 — Pick a separator",
+            context_lines=[f"File: {DIM}{sample}{R}"],
+            sub="What character splits the good part from the junk?",
+        )
+        print(f"  {DIM}{stem}{R}")
+        blank()
+        print(f"  {CYAN}1{R} dot \".\"     {CYAN}2{R} space \" \"     {CYAN}3{R} dash \"-\"     {CYAN}4{R} underscore \"_\"")
+        print(f"  {CYAN}5{R} type a custom separator")
+        blank()
+        raw = input(f"  Choice: ").strip().lower()
+        _check_back(raw)
+
+        sep_map = {"1": ".", "2": " ", "3": "-", "4": "_"}
+        if raw in sep_map:
+            sep = sep_map[raw]
+        elif raw == "5":
+            sep = ask("Separator", back=False)
+            if not sep:
+                continue
+        else:
+            err("Enter 1–5.")
+            input("  Press Enter to continue...")
+            continue
+
+        if sep not in stem:
+            warn(f"That separator doesn't appear in the filename.")
+            input("  Press Enter to continue...")
+            continue
+
+        tokens = stem.split(sep)
+        break
+
+    while True:
+        render(
+            title="Step 2/3 — Choose what to keep",
+            context_lines=[f"File: {DIM}{sample}{R}"],
+            sub="Pick the range of pieces to KEEP — everything else is dropped.",
+        )
+        for line in _trim_column_rows(tokens):
+            print(f"  {line}")
+        blank()
+        print(f"  {DIM}Example: \"0-4\" keeps pieces 0 through 4 and drops the rest.{R}")
+        print(f"  {DIM}\"0-0\" keeps just the first piece — handy when everything good")
+        print(f"  is already merged into one piece by this separator.{R}")
+        blank()
+
+        raw = input(f"  Keep range (e.g. \"0-4\"): ").strip()
+        if raw.lower() in ("b", "back"):
+            raise Back()
+
+        m = re.match(r'^(\d+)\s*-\s*(\d+)$', raw)
+        if not m:
+            err("Format: <start>-<end>, e.g. 0-4")
+            input("  Press Enter to continue...")
+            continue
+        start, end = int(m.group(1)), int(m.group(2))
+        if start > end:
+            start, end = end, start
+        if start >= len(tokens) or end >= len(tokens):
+            err(f"Valid range is 0–{len(tokens)-1}.")
+            input("  Press Enter to continue...")
+            continue
+
+        return sep, start, end, len(tokens)
+
+
+def _trim_column_rows(tokens: list[str], max_width: int = 70) -> list[str]:
+    """Same index/text column display style used in Mode 7."""
+    cols = []
+    for i, t in enumerate(tokens):
+        idx_str = str(i)
+        width = max(len(idx_str), len(t))
+        cols.append((idx_str, t, width))
+
+    groups, current, current_width = [], [], 0
+    for c in cols:
+        w = c[2] + 2
+        if current and current_width + w > max_width:
+            groups.append(current)
+            current, current_width = [], 0
+        current.append(c)
+        current_width += w
+    if current:
+        groups.append(current)
+
+    lines = []
+    for g in groups:
+        idx_parts = [f"{DIM}{i.ljust(w)}{R}" for i, t, w in g]
+        txt_parts = [f"{CYAN}{BOLD}{t.ljust(w)}{R}" for i, t, w in g]
+        lines.append("  ".join(idx_parts))
+        lines.append("  ".join(txt_parts))
+        lines.append("")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _trim_step_preview(files: list[Path], sep: str, start: int, end: int,
+                        sample_n: int) -> bool:
+    """Step 3: show a dry-run preview across the batch. Returns True to
+    proceed, False to go back and adjust the range."""
+    while True:
+        render(title="Step 3/3 — Preview")
+        any_fail = False
+        for f in files[:5]:
+            new_stem = _trim_build_plan(f.stem, sep, start, end, sample_n)
+            if not new_stem or new_stem == f.stem:
+                if new_stem == f.stem:
+                    print(f"  {YELLOW}={R} {DIM}{f.name}{R}  {DIM}(unchanged){R}")
+                else:
+                    print(f"  {RED}✗{R} {DIM}{f.name}{R}  {DIM}(would become empty — skipped){R}")
+                    any_fail = True
+                continue
+            new_name = new_stem + f.suffix.lower()
+            dryline(f"{DIM}{f.name}{R}")
+            print(f"           {GREEN}→ {new_name}{R}")
+        if any_fail:
+            warn("Some files would end up with an empty name and will be skipped.")
+
+        blank()
+        print(f"  {CYAN}1{R} Looks good, continue   {CYAN}2{R} Go back and change the range   {CYAN}b{R} Back")
+        raw = input(f"  Choice: ").strip().lower()
+        _check_back(raw)
+        if raw == "1":
+            return True
+        if raw == "2":
+            raise Back()
+
+
+def flow_trim_tail(files: list[Path], show: str, season: int, folder: Path):
+    render(title="Mode 8 — Trim Filename",
+           sub="For filenames that are already correct but have unwanted\n"
+               "  junk attached — split apart, keep what you want, drop the rest.")
+
+    sample = ""
+    sep, start, end, sample_n = "", 0, 0, 0
+    step = 1
+    while step <= 3:
+        try:
+            if step == 1:
+                sample = _trim_step_sample(files)
+                step = 2
+            elif step == 2:
+                sep, start, end, sample_n = _trim_step_separator_and_range(sample)
+                step = 3
+            elif step == 3:
+                if _trim_step_preview(files, sep, start, end, sample_n):
+                    step = 4
+        except Back:
+            step = max(1, step - 1)
+
+    def build(f, i):
+        new_stem = _trim_build_plan(f.stem, sep, start, end, sample_n)
+        if not new_stem or new_stem == f.stem:
+            return None
+        return new_stem + f.suffix.lower()
 
     return build
 
@@ -3304,12 +3532,312 @@ def util_define_season_ranges(folder: Path = None):
     info(f"{ok}/{len(plan)} file(s) organised into {len(ranges)} season folder(s).  {skip} skipped.")
 
 
+# ─── Set Up New Show + Season Folders ─────────────────────────────────────────
+#
+# Asks for a Source folder (where the show's root/season folders live or
+# will be created) and a Downloads folder (where new episode files show
+# up, NOT the system default Downloads). That folder PAIR is remembered
+# for next time — nothing else about the show is saved.
+#
+# If the Source folder already contains Season-named subfolders, this
+# skips straight to per-season file picking. Otherwise it asks for a show
+# title and a season count, creates the show folder + Season NN
+# subfolders, then walks through each season asking whether to pull files
+# in from the Downloads folder — selection is always manual, never
+# matched automatically by filename.
+
+SETUP_PAIR_FILE = _config_dir() / "setup_pair.json"
+
+
+def _load_setup_pair() -> tuple[Path, Path] | None:
+    if SETUP_PAIR_FILE.exists():
+        try:
+            data = json.loads(SETUP_PAIR_FILE.read_text())
+            src, dl = Path(data["source"]), Path(data["downloads"])
+            if src.is_dir() and dl.is_dir():
+                return src, dl
+        except Exception:
+            pass
+    return None
+
+
+def _save_setup_pair(source: Path, downloads: Path) -> None:
+    SETUP_PAIR_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SETUP_PAIR_FILE.write_text(json.dumps(
+        {"source": str(source), "downloads": str(downloads)}, indent=2
+    ))
+
+
+def _existing_season_folders(folder: Path) -> list[tuple[int, Path]]:
+    """Return (season_number, path) for every immediate subfolder of
+    `folder` whose name looks like a season folder, sorted by number."""
+    found = []
+    try:
+        for sub in folder.iterdir():
+            if sub.is_dir():
+                num = _detect_season_from_foldername(sub.name)
+                if num is not None:
+                    found.append((num, sub))
+    except PermissionError:
+        pass
+    return sorted(found, key=lambda pair: pair[0])
+
+
+def _pick_files_for_season(downloads_folder: Path, season_num: int) -> tuple[list[Path], Path | None]:
+    """
+    Interactive picker: shows the SUBFOLDERS directly inside the
+    Downloads folder (each one usually a single release/batch, e.g.
+    "MyShow.S01.Complete"), lets the user pick one, and returns every
+    media file found inside it — these get moved as a whole. Returns
+    (files, chosen_subfolder) so the caller can also clean up the empty
+    subfolder afterward; (empty list, None) if the season is skipped.
+    """
+    while True:
+        try:
+            subfolders = sorted(
+                e for e in downloads_folder.iterdir()
+                if e.is_dir() and not e.name.startswith(".")
+            )
+        except PermissionError:
+            subfolders = []
+
+        if not subfolders:
+            warn("No subfolders found in the Downloads folder.")
+            blank()
+            if ask_yn("Use the media files directly inside the Downloads folder instead?",
+                      default_yes=False, back=False):
+                direct_files = list_media(downloads_folder)
+                return direct_files, None
+            return [], None
+
+        render(
+            title=f"Pick a download folder for Season {season_num:02d}",
+            context_lines=[f"Downloads: {DIM}{downloads_folder}{R}"],
+            sub="Pick the subfolder whose files belong to this season — its\n"
+                "  contents get moved as a whole into the season folder.",
+        )
+        for i, sub in enumerate(subfolders, 1):
+            count = len(list_media(sub))
+            tag = f"{GREEN}{count} file(s){R}" if count else f"{DIM}empty{R}"
+            print(f"  {CYAN}{i:>3}{R}  {sub.name}  {DIM}({tag}){R}")
+        blank()
+        print(f"  {DIM}Type a number, or part of a name to search.{R}")
+        print(f"  {DIM}'done' = skip this season · 'b' = back{R}")
+        blank()
+
+        raw = input(f"  Choice: ").strip()
+        low = raw.lower()
+
+        if low in ("b", "back"):
+            raise Back()
+        if low == "done" or low == "":
+            return [], None
+
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(subfolders):
+                chosen = subfolders[idx]
+                files = list_media(chosen)
+                if not files:
+                    warn(f"'{chosen.name}' has no media files in it.")
+                    input("  Press Enter to continue...")
+                    continue
+                return files, chosen
+            err(f"Enter 1–{len(subfolders)}, a name, or 'done'.")
+            input("  Press Enter to continue...")
+            continue
+
+        # search by partial name
+        term = raw.lower()
+        matches = [s for s in subfolders if term in s.name.lower()]
+        if not matches:
+            err(f"No subfolders match '{raw}'.")
+            input("  Press Enter to continue...")
+            continue
+        if len(matches) == 1:
+            chosen = matches[0]
+            files = list_media(chosen)
+            if not files:
+                warn(f"'{chosen.name}' has no media files in it.")
+                input("  Press Enter to continue...")
+                continue
+            return files, chosen
+
+        render(title=f"Matches for \"{raw}\"",
+               context_lines=[f"Downloads: {DIM}{downloads_folder}{R}"])
+        for i, sub in enumerate(matches, 1):
+            count = len(list_media(sub))
+            print(f"  {CYAN}{i}{R}  {sub.name}  {DIM}({count} file(s)){R}")
+        blank()
+        pick = input(f"  Number (Enter=cancel): ").strip()
+        if pick.isdigit() and 1 <= int(pick) <= len(matches):
+            chosen = matches[int(pick) - 1]
+            files = list_media(chosen)
+            if files:
+                return files, chosen
+            warn(f"'{chosen.name}' has no media files in it.")
+            input("  Press Enter to continue...")
+
+
+def _confirm_and_move(files: list[Path], dest: Path) -> tuple[int, int]:
+    """Show a dry-run preview of moving files into dest, then apply on confirm."""
+    if not files:
+        return 0, 0
+
+    render(title=f"Move into {dest.name}", context_lines=[f"Destination: {DIM}{dest}{R}"])
+    print(f"  {BOLD}{len(files)} file(s) will be moved:{R}")
+    blank()
+    for f in files:
+        dryline(f"{DIM}{f.name}{R}")
+        print(f"           {GREEN}→ {dest.name}/{f.name}{R}")
+
+    blank()
+    if not ask_yn("Move these files?", default_yes=True, back=False):
+        info("Skipped — no files moved for this season.")
+        return 0, len(files)
+
+    ok = skip = 0
+    for f in files:
+        target = dest / f.name
+        if target.exists():
+            warn(f"SKIP — already exists: {target.name}")
+            skip += 1
+            continue
+        try:
+            shutil.move(str(f), str(target))
+            success(f"{f.name}  →  {dest.name}/")
+            ok += 1
+        except Exception as e:
+            err(f"Failed: {f.name}  ({e})")
+            skip += 1
+    return ok, skip
+
+
+def util_setup_show(source: Path = None, downloads: Path = None):
+    render(title="Set Up Show + Season Folders",
+           sub="Creates (or reuses) a show's season folders, then helps you\n"
+               "  pull files in from a Downloads folder, one season at a time.")
+
+    remembered = _load_setup_pair()
+
+    if remembered and source is None and downloads is None:
+        rem_source, rem_downloads = remembered
+        render(title="Set Up Show + Season Folders",
+               context_lines=[f"① Source:    {DIM}{rem_source}{R}",
+                               f"② Downloads: {DIM}{rem_downloads}{R}"])
+        print(f"  Use these folders again?")
+        blank()
+        if ask_yn("Use the folders shown above", default_yes=True, back=False):
+            source, downloads = rem_source, rem_downloads
+
+    # ── Step A: Source folder ──────────────────────────────────────────────────
+    if source is None:
+        source = pick_folder(
+            title="① Choose the Source folder",
+            sub="The show's root folder will be created here (or already exists here)."
+        )
+
+    # ── Step B: Downloads folder ────────────────────────────────────────────────
+    if downloads is None:
+        downloads = pick_folder(
+            title="② Choose the Downloads folder",
+            sub="Where new episode files show up — not necessarily your system Downloads."
+        )
+
+    _save_setup_pair(source, downloads)
+
+    # ── Step C: does Source already have season folders? ──────────────────────
+    show_root = source
+    existing = _existing_season_folders(source)
+
+    if not existing:
+        # Source itself might already BE a show folder with no seasons yet,
+        # or it might be a general media folder — either way, ask for a
+        # show title and create the structure fresh.
+        render(title="Set Up Show + Season Folders",
+               context_lines=[f"Source: {DIM}{source}{R}"])
+        show_title = ask("Show title", hint="A new folder with this name will be created here.", back=False)
+        if not show_title:
+            err("Show title cannot be empty.")
+            return
+
+        raw_n = ask("How many seasons?", default="1", back=False)
+        n_seasons = int(raw_n) if raw_n.isdigit() and int(raw_n) > 0 else 1
+
+        show_root = source / show_title
+        show_root.mkdir(parents=True, exist_ok=True)
+
+        for s in range(1, n_seasons + 1):
+            (show_root / f"Season {s:02d}").mkdir(exist_ok=True)
+
+        success(f"Created: {show_root}")
+        for s in range(1, n_seasons + 1):
+            info(f"  Season {s:02d}/")
+
+        existing = _existing_season_folders(show_root)
+    else:
+        info(f"Found {len(existing)} existing season folder(s) in {source} — "
+             f"skipping straight to filling them.")
+
+    if not existing:
+        warn("No season folders to fill — nothing more to do.")
+        return
+
+    # ── Step D/E: per-season, ask to pull from Downloads, pick files, move ────
+    for season_num, season_dir in existing:
+        blank()
+        render(title=f"Season {season_num:02d}",
+               context_lines=[f"Folder: {DIM}{season_dir}{R}"])
+        try:
+            look = ask_yn(f"Look for Season {season_num:02d} files in the Downloads folder?",
+                          default_yes=True)
+        except Back:
+            continue
+
+        if not look:
+            info(f"Skipped Season {season_num:02d}.")
+            continue
+
+        try:
+            chosen_files, chosen_subfolder = _pick_files_for_season(downloads, season_num)
+        except Back:
+            continue
+
+        if not chosen_files:
+            info(f"No files selected for Season {season_num:02d}.")
+            continue
+
+        ok, skip = _confirm_and_move(chosen_files, season_dir)
+        blank()
+        info(f"Season {season_num:02d}: {ok} moved, {skip} skipped.")
+
+        # If everything came from a subfolder and it's now empty, offer
+        # to remove it so the Downloads folder doesn't accumulate clutter.
+        if chosen_subfolder is not None and ok > 0:
+            try:
+                remaining = list(chosen_subfolder.iterdir())
+            except Exception:
+                remaining = None
+            if remaining is not None and not remaining:
+                blank()
+                if ask_yn(f"'{chosen_subfolder.name}' is now empty — delete it?",
+                          default_yes=True, back=False):
+                    try:
+                        chosen_subfolder.rmdir()
+                        success(f"Deleted: {chosen_subfolder.name}")
+                    except Exception as e:
+                        err(f"Could not delete folder: {e}")
+
+    blank()
+    success("Done setting up the show's folders.")
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 FLOW_BUILDERS = {
     "1": flow_fansub, "2": flow_one_pace, "3": flow_simple,
     "4": flow_sxxexx, "5": flow_custom_regex, "6": flow_regex_builder,
-    "7": flow_token_splitter,
+    "7": flow_token_splitter, "8": flow_trim_tail,
 }
 
 MODE_LABELS = {
@@ -3327,6 +3855,8 @@ MODE_LABELS = {
           "Step-by-step builder: pick a sample, identify its parts, rebuild."),
     "7": ("Split & Label",          "Blue.Box.S01E07.Title.1080p...-GROUP",
           "For dot/dash-bombed filenames — split on a separator, label each piece."),
+    "8": ("Trim Filename",          "Show - S01E01 - Title.1080p.WEBRip-GROUP",
+          "Already-correct names with junk attached — split, keep a range, drop the rest."),
 }
 
 
@@ -3344,20 +3874,22 @@ def main_menu():
         print(f"      {DIM}{summary}{R}")
     blank()
     print(f"  {BOLD}Utilities:{R}")
-    print(f"   {CYAN}8{R} Preview files in a folder")
+    print(f"   {CYAN}9{R} Preview files in a folder")
     print(f"      {DIM}Just lists the media files found — no renaming.{R}")
-    print(f"   {CYAN}9{R} Split into Season XX/ subfolders")
+    print(f"   {CYAN}10{R} Split into Season XX/ subfolders")
     print(f"      {DIM}Scans filenames for S01/S02 tags and sorts files into folders.{R}")
-    print(f"   {CYAN}10{R} Rename show name across files")
+    print(f"   {CYAN}11{R} Rename show name across files")
     print(f"      {DIM}Swaps the show-name prefix on files already named ...-S01E01.{R}")
-    print(f"   {CYAN}11{R} Overwrite by Episode Number")
+    print(f"   {CYAN}12{R} Overwrite by Episode Number")
     print(f"      {DIM}Replaces a Source file's content with a Match file's, by S/E number.{R}")
-    print(f"   {CYAN}12{R} Clean up backup folders")
-    print(f"      {DIM}Finds and deletes .backup_before_overwrite folders left by option 11.{R}")
-    print(f"   {CYAN}13{R} Renumber / Move Season")
+    print(f"   {CYAN}13{R} Clean up backup folders")
+    print(f"      {DIM}Finds and deletes .backup_before_overwrite folders left by option 12.{R}")
+    print(f"   {CYAN}14{R} Renumber / Move Season")
     print(f"      {DIM}Moves a season's episodes, appends them, and closes any gaps.{R}")
-    print(f"   {CYAN}14{R} Split Into Seasons By Range")
+    print(f"   {CYAN}15{R} Split Into Seasons By Range")
     print(f"      {DIM}Define episode ranges — each becomes its own Season folder.{R}")
+    print(f"   {CYAN}16{R} Set Up Show + Season Folders")
+    print(f"      {DIM}Create season folders and pull files in from a Downloads folder.{R}")
     print(f"   {CYAN}q{R} Quit")
     blank()
     return input(f"  {BOLD}Choice{R}: ").strip().lower()
@@ -3385,43 +3917,50 @@ def main():
             print(f"\n  {DIM}Bye!{R}\n")
             break
 
-        if choice == "8":
+        if choice == "9":
             util_preview(pick_folder())
             input("\n  Press Enter to return to menu...")
             continue
-        if choice == "9":
+        if choice == "10":
             util_split(pick_folder())
             input("\n  Press Enter to return to menu...")
             continue
-        if choice == "10":
+        if choice == "11":
             util_rename_show(pick_folder())
             input("\n  Press Enter to return to menu...")
             continue
-        if choice == "11":
+        if choice == "12":
             util_overwrite_by_episode()
             input("\n  Press Enter to return to menu...")
             continue
-        if choice == "12":
+        if choice == "13":
             util_cleanup_backups()
             input("\n  Press Enter to return to menu...")
             continue
-        if choice == "13":
+        if choice == "14":
             try:
                 util_renumber_season()
             except Back:
                 pass
             input("\n  Press Enter to return to menu...")
             continue
-        if choice == "14":
+        if choice == "15":
             try:
                 util_define_season_ranges()
             except Back:
                 pass
             input("\n  Press Enter to return to menu...")
             continue
+        if choice == "16":
+            try:
+                util_setup_show()
+            except Back:
+                pass
+            input("\n  Press Enter to return to menu...")
+            continue
 
         if choice not in FLOW_BUILDERS:
-            err("Please enter 1–14 or q.")
+            err("Please enter 1–16 or q.")
             input("  Press Enter to continue...")
             continue
 
