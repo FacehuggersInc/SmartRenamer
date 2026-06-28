@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-run.py — launcher for the src.
+run.py — launcher for the rename_media_package.
 
 This file exists purely so you can run the tool the same simple way as
 before:
@@ -8,8 +8,8 @@ before:
     ./run.py
     ./run.py /path/to/your/show
 
-It just makes sure Python can find the src next to it,
-then hands off to the real entry point in src/main.py.
+It just makes sure Python can find the rename_media_package next to it,
+then hands off to the real entry point in rename_media_package/main.py.
 You should never need to edit this file.
 """
 import sys
@@ -18,6 +18,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.main import main, _fs_module
+from src.core import metadata as _metadata_module
+
+# The .env file (PLEX_TOKEN, etc.) is expected to live right next to
+# this launcher script — tell core.metadata exactly where that is so it
+# never has to guess from the current working directory.
+_metadata_module._LAUNCHER_DIR = Path(__file__).resolve().parent
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:

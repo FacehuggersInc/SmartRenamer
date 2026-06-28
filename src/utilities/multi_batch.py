@@ -10,6 +10,7 @@ from ..core import display as _display
 from ..core.display import BOLD, CYAN, DIM, R, ask_yn, blank, err, info, render, success, warn
 from ..core.filesystem import list_media, pick_folder
 from ..core.registry import UtilEntry
+from .season_tools import util_renumber_season
 from .setup_show import _existing_season_folders
 
 
@@ -43,6 +44,14 @@ def util_multi_batch(root: Path = None):
         for i, (season_num, season_dir) in enumerate(seasons, 1):
             _display._BATCH_CONTEXT = f"Multi-Batch — Season {season_num:02d}  ({i} of {total})"
 
+            if not season_dir.is_dir():
+                render(title=f"Season {season_num:02d}",
+                       context_lines=[f"Folder: {DIM}{season_dir}{R}"])
+                info(f"This folder no longer exists — probably moved into another\n"
+                     f"      season earlier in this batch. Skipping.")
+                input("  Press Enter to continue...")
+                continue
+
             render(title=f"Season {season_num:02d}",
                    context_lines=[f"Folder: {DIM}{season_dir}{R}"])
 
@@ -57,6 +66,8 @@ def util_multi_batch(root: Path = None):
                 print(f"   {CYAN}{k}{R} {label:<24}{DIM}{example}{R}")
                 print(f"      {DIM}{summary}{R}")
             blank()
+            print(f"   {CYAN}move{R} Move this season under another season number")
+            print(f"      {DIM}Renumber + relocate these episodes (e.g. fold Season 02 into Season 01).{R}")
             print(f"   {CYAN}skip{R} Skip this season entirely")
             blank()
 
@@ -64,6 +75,11 @@ def util_multi_batch(root: Path = None):
 
             if mode_choice == "skip":
                 info(f"Skipped Season {season_num:02d}.")
+                continue
+
+            if mode_choice == "move":
+                util_renumber_season(season_dir)
+                input("\n  Press Enter to continue...")
                 continue
 
             if mode_choice not in FLOW_BUILDERS:

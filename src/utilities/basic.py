@@ -112,6 +112,59 @@ def util_rename_show(folder: Path):
     info(f"{ok}/{len(pairs)} files renamed.")
 
 
+EP_TYPO_PATTERN = re.compile(r'([Ss])(\d{1,2})[\s._-]*[Ee][Pp][\s._-]*(\d{1,3})')
+
+def util_fix_ep_typo(folder: Path):
+    render(title="Fix S01EP01 → S01E01",
+           sub="Some systems only recognise 'S01E01' — this fixes filenames\n"
+               "  that use 'S01EP01', 's01 ep 01', 's01.ep.01', etc.")
+    files = list_media(folder)
+    if not files:
+        warn("No media files found.")
+        return
+
+    def fix(name: str) -> str:
+        def replacer(m):
+            season_letter, season_num, ep_num = m.groups()
+            return f"{season_letter}{int(season_num):02d}E{int(ep_num):02d}"
+        return EP_TYPO_PATTERN.sub(replacer, name)
+
+    pairs: list[tuple[Path, Path]] = []
+    for f in files:
+        fixed_name = sanitize_filename(fix(f.name))
+        if fixed_name != f.name:
+            pairs.append((f, folder / fixed_name))
+
+    if not pairs:
+        info("No files needed fixing — none matched the 'EP' pattern.")
+        return
+
+    blank()
+    print(f"  {BOLD}{len(pairs)} file(s) will be renamed:{R}")
+    for src, dst in pairs:
+        dryline(f"{DIM}{src.name}{R}")
+        print(f"           {GREEN}→ {dst.name}{R}")
+
+    blank()
+    if not ask_yn("Apply these renames?", back=False):
+        info("Cancelled.")
+        return
+
+    ok = 0
+    for src, dst in pairs:
+        if dst.exists() and dst != src:
+            warn(f"SKIP — exists: {dst.name}")
+            continue
+        try:
+            src.rename(dst)
+            success(f"{DIM}{src.name}{R}\n     → {GREEN}{dst.name}{R}")
+            ok += 1
+        except Exception as e:
+            err(f"Failed: {e}")
+    blank()
+    info(f"{ok}/{len(pairs)} files renamed.")
+
+
 UTILITY_ENTRIES = [
     UtilEntry(
         "Preview files in a folder",
@@ -127,5 +180,10 @@ UTILITY_ENTRIES = [
         "Rename show name across files",
         "Swaps the show-name prefix on files already named ...-S01E01.",
         util_rename_show,
+    ),
+    UtilEntry(
+        "Fix S01EP01 → S01E01",
+        "Corrects filenames using 'EP' instead of 'E', which some systems won't recognise.",
+        util_fix_ep_typo,
     ),
 ]

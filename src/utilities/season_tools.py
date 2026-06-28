@@ -15,16 +15,17 @@ from ..core.registry import UtilEntry
 
 
 SEASON_FOLDER_PATTERNS = [
-    re.compile(r"^season\s*0*(\d+)$", re.IGNORECASE),
-    re.compile(r"^s0*(\d+)$", re.IGNORECASE),
-    re.compile(r"^season[_\-]0*(\d+)$", re.IGNORECASE),
+    re.compile(r"^season\s*0*(\d+)(?:\s*[-_:]\s*.+)?$", re.IGNORECASE),
+    re.compile(r"^s0*(\d+)(?:\s*[-_:]\s*.+)?$", re.IGNORECASE),
+    re.compile(r"^season[_\-]0*(\d+)(?:\s*[-_:]\s*.+)?$", re.IGNORECASE),
 ]
 
 EP_NUM_PATTERN = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})")
 
 def _detect_season_from_foldername(name: str) -> int | None:
-    """Recognise 'Season 02', 'S02', 'Season_2', etc. Returns the season
-    number, or None if the folder name doesn't look like a season folder."""
+    """Recognise 'Season 02', 'S02', 'Season_2', 'Season 01 - Subtitle',
+    etc. Returns the season number, or None if the folder name doesn't
+    look like a season folder."""
     name = name.strip()
     for pat in SEASON_FOLDER_PATTERNS:
         m = pat.match(name)
@@ -36,13 +37,39 @@ def _extract_ep_num(filename: str) -> int | None:
     m = EP_NUM_PATTERN.search(filename)
     return int(m.group(2)) if m else None
 
+def _extract_ep_width(filename: str) -> int | None:
+    """How many digits wide the episode number is AS WRITTEN in the
+    filename — e.g. 'S01E03' returns 2, 'S01E003' returns 3. This is
+    different from len(str(episode_number)): 'E03' is 2 characters even
+    though int('03') only prints back as '3'. Used to detect when an
+    already-correct episode number still needs re-padding because the
+    season as a whole has grown to need more digits."""
+    m = EP_NUM_PATTERN.search(filename)
+    return len(m.group(2)) if m else None
+
 def _extract_season_num(filename: str) -> int | None:
     m = EP_NUM_PATTERN.search(filename)
     return int(m.group(1)) if m else None
 
-def _renumber_se_in_filename(filename: str, new_season: int, new_ep: int) -> str:
-    """Replace the first SxxExx occurrence in a filename with new numbers."""
-    return EP_NUM_PATTERN.sub(f"S{new_season:02d}E{new_ep:02d}", filename, count=1)
+def _renumber_se_in_filename(filename: str, new_season: int, new_ep: int,
+                              ep_width: int = 2) -> str:
+    """
+    Replace the first SxxExx occurrence in a filename with new numbers.
+
+    ep_width controls how many digits the episode number is padded to —
+    pass the width needed for the HIGHEST episode number this season
+    will end up with, not just the current one. This matters once a
+    season crosses 99 episodes: zero-padding every file to only 2 digits
+    would produce E100 sitting right next to E01-E99, and most file
+    managers/media servers sort those alphabetically — '1' comes before
+    '9' as a character, so E100/E101/... would sort BEFORE E99, putting
+    them in the wrong place. Padding everything in that season to 3
+    digits (E001, E002, ..., E100) keeps the sort order correct.
+    """
+    ep_width = max(ep_width, len(str(new_ep)))   # never truncate, only widen
+    return EP_NUM_PATTERN.sub(
+        f"S{new_season:02d}E{new_ep:0{ep_width}d}", filename, count=1
+    )
 
 def _resolve_season_root(folder: Path) -> Path:
     """
@@ -149,12 +176,15 @@ def _settle_gaps(folder: Path, season_num: int, dry_run: bool = True) -> list[tu
     numbered.sort(key=lambda pair: pair[1])
     start = 1   # episode numbering always starts at 1, regardless of what
                 # the lowest existing number in the folder happens to be
+    final_highest_ep = start + len(numbered) - 1
+    ep_width = max(2, len(str(final_highest_ep)))
 
     plan = []
     for i, (f, old_ep) in enumerate(numbered):
         new_ep = start + i
-        if new_ep != old_ep:
-            new_name = _renumber_se_in_filename(f.name, season_num, new_ep)
+        existing_width = _extract_ep_width(f.name) or 2
+        if new_ep != old_ep or existing_width < ep_width:
+            new_name = _renumber_se_in_filename(f.name, season_num, new_ep, ep_width)
             plan.append((f, new_name))
     return plan
 
@@ -266,6 +296,9 @@ def util_renumber_season(folder: Path = None):
         key=lambda pair: (pair[1] is None, pair[1])
     )
 
+    final_highest_ep = highest_existing + len(incoming)
+    ep_width = max(2, len(str(final_highest_ep)))
+
     # ── Build the full plan: move+renumber incoming, then settle gaps ─────────
     render(title="Renumber / Move Season — Preview",
            context_lines=[
@@ -277,7 +310,7 @@ def util_renumber_season(folder: Path = None):
     plan: list[tuple[Path, Path]] = []   # (src, dst) — dst may be in a different folder
     next_ep = highest_existing + 1
     for f, old_ep in incoming:
-        new_name = _renumber_se_in_filename(f.name, target_season, next_ep)
+        new_name = _renumber_se_in_filename(f.name, target_season, next_ep, ep_width)
         plan.append((f, dest_folder / new_name))
         next_ep += 1
 
@@ -355,6 +388,26 @@ def util_renumber_season(folder: Path = None):
     else:
         info(f"No gaps found in season {target_season} — episode numbers are contiguous.")
 
+    _offer_metadata_fetch(_resolve_season_root(dest_folder) if _detect_season_from_foldername(dest_folder.name) else dest_folder)
+
+
+def _offer_metadata_fetch(show_folder: Path) -> None:
+    """
+    Offered at the end of every tool that finishes with a show's season
+    folders in a known-good state — the best moment to also pull correct
+    episode titles. Declining just skips it; nothing else in the calling
+    tool depends on this running. Imported locally to avoid a circular
+    import (plex_metadata.py imports helpers from this file).
+    """
+    blank()
+    if not ask_yn("Fetch correct episode titles for this show now?", default_yes=False, back=False):
+        return
+    from .plex_metadata import fetch_and_apply_metadata
+    try:
+        fetch_and_apply_metadata(show_folder)
+    except Back:
+        pass
+
 def util_define_season_ranges(folder: Path = None):
     render(title="Split Into Seasons By Range",
            sub="Define episode ranges (e.g. 1-12, 13-24) and each range becomes\n"
@@ -370,6 +423,19 @@ def util_define_season_ranges(folder: Path = None):
     if not files:
         warn("No media files found in that folder.")
         return
+
+    # If the user pointed this at a SEASON folder directly (common when
+    # a single-season show needs splitting into multiple seasons), new
+    # Season NN folders must be created as SIBLINGS of it, not nested
+    # inside it — e.g. ".../Show/Season 02" next to ".../Show/Season 01",
+    # never ".../Show/Season 01/Season 02". Resolve the real root once,
+    # up front, and create every new season folder there instead.
+    season_root = folder
+    if _detect_season_from_foldername(folder.name) is not None:
+        season_root = _resolve_season_root(folder)
+        info(f"'{folder.name}' looks like a season folder itself — new season "
+             f"folders will be created at:\n      {DIM}{season_root}{R}")
+        blank()
 
     numbered = [(f, _extract_ep_num(f.name)) for f in files]
     numbered = [(f, ep) for f, ep in numbered if ep is not None]
@@ -466,9 +532,10 @@ def util_define_season_ranges(folder: Path = None):
     for season_num, start, end in ranges:
         season_files = [(f, ep) for f, ep in numbered if start <= ep <= end]
         season_files.sort(key=lambda pair: pair[1])
-        season_dir = folder / f"Season {season_num:02d}"
+        season_dir = season_root / f"Season {season_num:02d}"
+        ep_width = max(2, len(str(len(season_files))))
         for i, (f, old_ep) in enumerate(season_files, 1):
-            new_name = _renumber_se_in_filename(f.name, season_num, i)
+            new_name = _renumber_se_in_filename(f.name, season_num, i, ep_width)
             plan.append((f, season_dir / new_name))
 
     render(title="Split Into Seasons By Range — Preview",
@@ -495,7 +562,7 @@ def util_define_season_ranges(folder: Path = None):
         info("Cancelled — no files changed.")
         return
 
-    if not _confirm_show_name_for_folder(folder, len(plan), "organise"):
+    if not _confirm_show_name_for_folder(season_root, len(plan), "organise"):
         return
 
     render(title="Splitting into seasons…")
@@ -516,6 +583,8 @@ def util_define_season_ranges(folder: Path = None):
 
     blank()
     info(f"{ok}/{len(plan)} file(s) organised into {len(ranges)} season folder(s).  {skip} skipped.")
+
+    _offer_metadata_fetch(folder)
 
 
 UTILITY_ENTRIES = [

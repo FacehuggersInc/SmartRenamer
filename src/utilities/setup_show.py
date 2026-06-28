@@ -12,7 +12,7 @@ from ..core.config import _config_dir
 from ..core.display import BOLD, Back, CYAN, DIM, GREEN, R, YELLOW, ask, ask_yn, blank, dryline, err, info, render, success, warn
 from ..core.filesystem import list_media, pick_folder
 from ..core.registry import UtilEntry
-from .season_tools import _detect_season_from_foldername
+from .season_tools import _detect_season_from_foldername, _offer_metadata_fetch
 
 
 SETUP_PAIR_FILE = _config_dir() / "setup_pair.json"
@@ -348,6 +348,8 @@ def util_setup_show(source: Path = None, downloads: Path = None):
 
     blank()
     success("Done setting up the show's folders.")
+
+    _offer_metadata_fetch(show_root)
 
 
 UTILITY_ENTRIES = [
