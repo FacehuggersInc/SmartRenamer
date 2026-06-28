@@ -112,31 +112,40 @@ def util_rename_show(folder: Path):
     info(f"{ok}/{len(pairs)} files renamed.")
 
 
-EP_TYPO_PATTERN = re.compile(r'([Ss])(\d{1,2})[\s._-]*[Ee][Pp][\s._-]*(\d{1,3})')
-
-def util_fix_ep_typo(folder: Path):
-    render(title="Fix S01EP01 → S01E01",
-           sub="Some systems only recognise 'S01E01' — this fixes filenames\n"
-               "  that use 'S01EP01', 's01 ep 01', 's01.ep.01', etc.")
+def util_find_replace(folder: Path):
+    render(title="Find & Replace in Filenames",
+           sub="Replace one exact piece of text with another, across every\n"
+               "  filename in the folder — e.g. swap 'ep' for 'e' to turn\n"
+               "  'Show - s01ep01.mkv' into 'Show - s01e01.mkv'.")
     files = list_media(folder)
     if not files:
         warn("No media files found.")
         return
 
-    def fix(name: str) -> str:
-        def replacer(m):
-            season_letter, season_num, ep_num = m.groups()
-            return f"{season_letter}{int(season_num):02d}E{int(ep_num):02d}"
-        return EP_TYPO_PATTERN.sub(replacer, name)
+    target = ask("Text to find", back=False)
+    if not target:
+        err("Nothing entered — cancelled.")
+        return
 
+    replacement = ask("Replace it with", default="", back=False)
+    blank()
+    case_sensitive = ask_yn("Match case exactly?", default_yes=False, back=False)
+
+    flags = 0 if case_sensitive else re.IGNORECASE
+    pattern = re.compile(re.escape(target), flags)
+
+    # Only ever touch the STEM — the extension is never part of the
+    # search/replace, so a target string that happens to also appear in
+    # a file extension (e.g. searching for "mkv") can't corrupt it.
     pairs: list[tuple[Path, Path]] = []
     for f in files:
-        fixed_name = sanitize_filename(fix(f.name))
-        if fixed_name != f.name:
-            pairs.append((f, folder / fixed_name))
+        new_stem, count = pattern.subn(replacement, f.stem)
+        if count > 0:
+            new_name = sanitize_filename(new_stem + f.suffix.lower())
+            pairs.append((f, folder / new_name))
 
     if not pairs:
-        info("No files needed fixing — none matched the 'EP' pattern.")
+        info(f"No files contained \"{target}\" — nothing to change.")
         return
 
     blank()
@@ -182,8 +191,8 @@ UTILITY_ENTRIES = [
         util_rename_show,
     ),
     UtilEntry(
-        "Fix S01EP01 → S01E01",
-        "Corrects filenames using 'EP' instead of 'E', which some systems won't recognise.",
-        util_fix_ep_typo,
+        "Find & Replace in Filenames",
+        "Replace one exact piece of text with another, across every filename in a folder.",
+        util_find_replace,
     ),
 ]

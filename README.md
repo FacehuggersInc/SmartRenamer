@@ -29,9 +29,10 @@ chmod +x run.py
 - **Preview files in a folder** — lists media files, no renaming
 - **Split into Season XX/ subfolders** — sorts files by S01/S02 tag
 - **Rename show name across files** — swaps the show-name prefix on already-renamed files
-- **Fix S01EP01 → S01E01** — corrects filenames using `EP` instead of `E` (e.g.
-  `Show - s01ep01.mkv`), which some media servers won't recognise as a valid
-  episode tag at all
+- **Find & Replace in Filenames** — replace one exact piece of text with
+  another across every filename in a folder (case-sensitive or not). Handy
+  for fixing something like `s01ep01` → `s01e01` when a media server won't
+  recognise `EP` as a valid episode tag, but works for any text swap
 - **Multi-Batch Rename** — runs a rename mode across every Season folder in turn
 - **Overwrite by Episode Number** — replaces a Source file's content with a Match file's, by episode
 - **Clean up backup folders** — deletes leftover `.backup_before_overwrite` folders
