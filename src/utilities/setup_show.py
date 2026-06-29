@@ -349,6 +349,14 @@ def util_setup_show(source: Path = None, downloads: Path = None):
     blank()
     success("Done setting up the show's folders.")
 
+    blank()
+    if ask_yn("Rename these files now?", default_yes=True, back=False):
+        from .multi_batch import util_multi_batch
+        try:
+            util_multi_batch(show_root)
+        except Back:
+            pass
+
     _offer_metadata_fetch(show_root)
 
 

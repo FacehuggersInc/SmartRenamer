@@ -118,6 +118,78 @@ def search_anime(query: str, limit: int = 5) -> list[dict]:
     return results
 
 
+# ─── Anime Metadata Search Engine support ──────────────────────────────────────
+# Separate from search_anime() above (which is tuned for the
+# Fetch-&-Apply-Metadata flow) — these keep full pagination info and
+# more fields, for a tool that lets the user browse Jikan directly.
+
+ANIME_ENDPOINTS: dict[str, str] = {
+    "full":            "Full record (synopsis, score, genres, studios, etc.)",
+    "characters":      "Characters",
+    "staff":           "Staff",
+    "episodes":        "Episode list",
+    "news":            "News",
+    "videos":          "Videos (promos, episode previews)",
+    "pictures":        "Pictures",
+    "statistics":      "Statistics (watching/completed/dropped counts)",
+    "recommendations": "Recommendations (similar anime)",
+    "reviews":         "Reviews",
+    "relations":       "Relations (sequels, spin-offs, adaptations)",
+    "themes":          "Themes (opening/ending songs)",
+    "external":        "External links",
+}
+
+
+def search_anime_paginated(query: str, page: int = 1) -> dict:
+    """
+    Search MyAnimeList via Jikan, keeping full pagination info. Returns
+    {"results": [...], "has_next_page": bool, "last_visible_page": int}.
+    Each result has: mal_id, title, title_english, year, episode_count,
+    type, status, synopsis.
+    """
+    data = _jikan_get("/anime", {"q": query, "page": page})
+    results = []
+    for item in data.get("data", []):
+        year = None
+        aired = item.get("aired") or {}
+        from_date = aired.get("from")
+        if from_date:
+            year = from_date[:4]
+        results.append({
+            "mal_id": item["mal_id"],
+            "title": item.get("title") or item.get("title_english") or "Unknown",
+            "title_english": item.get("title_english"),
+            "year": year,
+            "episode_count": item.get("episodes"),
+            "type": item.get("type"),
+            "status": item.get("status"),
+            "synopsis": item.get("synopsis"),
+        })
+    pagination = data.get("pagination", {})
+    return {
+        "results": results,
+        "has_next_page": pagination.get("has_next_page", False),
+        "last_visible_page": pagination.get("last_visible_page", 1),
+    }
+
+
+def fetch_anime_endpoint(mal_id: int, endpoint: str, page: int = 1) -> dict:
+    """
+    Fetch one of ANIME_ENDPOINTS for a given MyAnimeList ID. Returns the
+    raw Jikan response dict (so callers can inspect "data" and
+    "pagination" themselves — different endpoints shape their data
+    differently, e.g. "full" has no pagination at all, "characters"
+    does). `page` is ignored by endpoints that don't paginate.
+    """
+    if endpoint == "full":
+        path = f"/anime/{mal_id}/full"
+        params = None
+    else:
+        path = f"/anime/{mal_id}/{endpoint}"
+        params = {"page": page} if page > 1 else None
+    return _jikan_get(path, params)
+
+
 def fetch_episode_titles(mal_id: int) -> tuple[dict[int, str], set[int]]:
     """
     Fetch every episode's title for a MyAnimeList entry, paginated.

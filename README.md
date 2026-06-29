@@ -42,7 +42,13 @@ chmod +x run.py
   caveats
 - **Renumber / Move Season** — moves a season's episodes, appends them, closes gaps
 - **Split Into Seasons By Range** — turns a flat folder of episodes into Season folders
-- **Set Up Show + Season Folders** — creates season folders and pulls files in from Downloads
+- **Set Up Show + Season Folders** — creates season folders, pulls files in
+  from Downloads, then offers to rename them (via Multi-Batch Rename) and
+  fetch episode metadata, in that order
+- **Anime Metadata Search** — search MyAnimeList directly and browse
+  episodes, characters, staff, pictures, and more for any anime; doesn't
+  touch any files, just for looking things up and optionally saving the
+  data to a file
 
 (Exact menu numbers depend on what's installed — the menu lists them for you
 with a one-line description under each.)
